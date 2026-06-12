@@ -417,6 +417,45 @@ def test_concurrent_close_calls_do_not_hang_or_leak() -> None:
             pool.close()
 
 
+def test_sync_session_exit_during_close_releases_slot_cleanly() -> None:
+    for iteration in range(5):
+        baseline_threads = set(threading.enumerate())
+        pool = ClaudePool(**pool_kwargs(max_workers=1))
+        entered = threading.Event()
+        errors: list[BaseException] = []
+        results: list[Result] = []
+        lock = threading.Lock()
+
+        def session_worker() -> None:
+            try:
+                with pool.session_sync() as session:
+                    entered.set()
+                    result = session.send("session-before-close")
+                    with lock:
+                        results.append(result)
+                    time.sleep(0.5)
+            except BaseException as exc:
+                with lock:
+                    errors.append(exc)
+
+        thread = threading.Thread(target=session_worker, name=f"sync-session-close-{iteration}")
+        thread.start()
+        try:
+            assert entered.wait(timeout=5.0)
+            time.sleep(0.2)
+            pool.close()
+
+            join_threads([thread], timeout=10.0)
+            assert not errors
+            assert len(results) == 1
+            assert results[0].text == "session-before-close"
+            wait_for_thread_baseline(baseline_threads)
+            wait_for_no_live_process_groups()
+        finally:
+            join_threads([thread], timeout=10.0)
+            pool.close()
+
+
 def test_ask_sync_churn_during_close_returns_results_or_pool_closed() -> None:
     pool = ClaudePool(**pool_kwargs(max_workers=4))
     errors: list[BaseException] = []

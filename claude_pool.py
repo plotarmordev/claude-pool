@@ -453,7 +453,7 @@ class _SyncSession:
         if self._closed:
             return None
         self._closed = True
-        self._pool._run_sync(self._session.__aexit__(exc_type, exc, tb))
+        self._pool._run_sync(self._session.__aexit__(exc_type, exc, tb), cleanup=True)
         return None
 
 
@@ -707,7 +707,9 @@ class ClaudePool:
         try:
             close_future = asyncio.run_coroutine_threadsafe(self._aclose(), loop)
             close_future.result()
-            concurrent.futures.wait(tuple(self._sync_inflight), timeout=10.0)
+            with self._sync_mutex:
+                inflight = tuple(self._sync_inflight)
+            concurrent.futures.wait(inflight, timeout=10.0)
             with self._sync_mutex:
                 self._stop_sync_loop_locked()
         except BaseException:
@@ -735,11 +737,15 @@ class ClaudePool:
                     "pool already used through async API; create a separate pool for sync use"
                 )
 
-    def _run_sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
+    def _run_sync(self, coro: Coroutine[Any, Any, Any], *, cleanup: bool = False) -> Any:
         with self._sync_mutex:
-            if self._sync_stopping:
+            if self._sync_stopping and not cleanup:
                 coro.close()
                 raise PoolClosed("pool is closed")
+            if self._sync_stopping and self._sync_loop is None:
+                coro.close()
+                raise PoolClosed("pool is closed")
+            # Cleanup submissions may release resources that the in-flight close is waiting on.
             loop = self._ensure_sync_loop_locked()
             future = asyncio.run_coroutine_threadsafe(coro, loop)
             self._sync_inflight.add(future)
