@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import os
 from pathlib import Path
 import stat
@@ -311,6 +312,23 @@ def test_aclose_waits_for_in_flight_ask_and_reaps_process_group() -> None:
         result = await task
 
         assert result.text == "SLEEP:1"
+        for pgid in pgids:
+            await assert_process_group_gone(pgid)
+
+    run(scenario())
+
+
+def test_aclose_serializes_with_in_flight_start_prewarm() -> None:
+    async def scenario() -> None:
+        pool = ClaudePool(**pool_kwargs(warm=1))
+        start_task = asyncio.create_task(pool.start())
+        await asyncio.sleep(0.1)
+        pgids = tuple(_LIVE_PGIDS)
+
+        await pool.aclose()
+        with suppress(PoolClosed):
+            await start_task
+
         for pgid in pgids:
             await assert_process_group_gone(pgid)
 

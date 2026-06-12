@@ -509,8 +509,9 @@ class ClaudePool:
         for _ in range(self._max_workers):
             await self._semaphore.acquire()
             acquired += 1
-        warm = list(self._warm)
-        self._warm.clear()
+        async with self._replenish_lock:
+            warm = list(self._warm)
+            self._warm.clear()
         for worker in warm:
             self._reap(worker)
         if self._reaper_tasks:
