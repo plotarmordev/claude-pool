@@ -43,6 +43,16 @@ Prompts are written through bracketed paste, followed by carriage return:
 ESC [ 200 ~ <prompt bytes> ESC [ 201 ~ \r
 ```
 
+Observed submit timing on Claude Code 2.1.175:
+
+- Wait at least 0.75 s after the `SessionStart` marker before the first paste
+  on a worker.
+- Wait 0.3 s between the end of bracketed paste and the carriage return.
+- If no Stop-hook line arrives within 3.0 s after the first carriage return,
+  send one additional carriage return. Pressing Enter on an empty input box is
+  a no-op; if the first carriage return was swallowed while the TUI was still
+  processing paste insertion, the retry submits the existing prompt.
+
 The Stop hook receives a JSON object on stdin at the end of a turn and appends
 one JSON line to the worker hook file. Observed payload fields include:
 
@@ -72,3 +82,7 @@ callers can match text such as `Invalid API key` or `/login`.
 Mid-session usage-limit or policy text is ordinary assistant output from the
 TUI. It is returned as normal `Result.text`; callers classify that text the same
 way they do for stream-json stdout today.
+
+The TUI also renders a weekly-limit usage banner in the pty tail, for example
+`Youve used N% of your weekly limit`. This is useful future signal but is not
+parsed today.

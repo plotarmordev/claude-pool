@@ -90,7 +90,24 @@ def test_tui_worker_happy_echo_and_result_conversion() -> None:
             assert result.usage["input_tokens"] == 3
             assert result.cost_usd == 0.0
             assert result.rate_limit is None
+            assert worker._last_ask_cr_retries == 0
             assert worker.alive is True
+        finally:
+            await worker.retire()
+
+    run(scenario())
+
+
+def test_tui_worker_retries_submit_when_first_enter_is_swallowed() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake(env={"FAKE_TUI_SWALLOW_FIRST_CR": "1"})
+        started = time.monotonic()
+        try:
+            result_message, _rate_limit = await worker.ask("retry-submit", timeout=6.0)
+
+            assert result_message["result"] == "retry-submit"
+            assert worker._last_ask_cr_retries == 1
+            assert time.monotonic() - started < 5.0
         finally:
             await worker.retire()
 

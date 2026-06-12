@@ -36,6 +36,9 @@ import uuid
 
 _STDOUT_LIMIT = 10 * 2**20
 _STDERR_LIMIT = 64 * 1024
+_TUI_FIRST_PASTE_SETTLE = 0.75
+_TUI_PASTE_TO_CR = 0.3
+_TUI_CR_RETRY_AFTER = 3.0
 _LIVE_PGIDS: set[int] = set()
 logger = logging.getLogger("claude_pool")
 
@@ -403,6 +406,8 @@ class _TuiWorker:
         self._tail_lock = threading.Lock()
         self._reader_stop = threading.Event()
         self._ask_lock = asyncio.Lock()
+        self._ready_at = 0.0
+        self._last_ask_cr_retries = 0
         self._killed = False
         self._reader_thread = threading.Thread(
             target=self._drain_pty,
@@ -549,14 +554,16 @@ class _TuiWorker:
 
         started = time.monotonic()
         deadline = started + timeout if timeout is not None else None
+        self._last_ask_cr_retries = 0
         try:
             hook_offset = os.path.getsize(self._hook_path)
         except OSError:
             hook_offset = 0
 
         try:
+            await self._sleep_until_first_paste_ready(deadline)
             await self._write_master(b"\x1b[200~" + prompt.encode() + b"\x1b[201~", deadline)
-            await asyncio.sleep(0.05)
+            await self._sleep_with_deadline(_TUI_PASTE_TO_CR, deadline)
             await self._write_master(b"\r", deadline)
         except AskTimeout:
             await self.kill()
@@ -566,6 +573,8 @@ class _TuiWorker:
             await self.kill()
             raise WorkerCrashError("worker exited before accepting input", tail) from exc
 
+        retry_at = time.monotonic() + _TUI_CR_RETRY_AFTER
+        cr_retried = False
         while True:
             payload, hook_offset = self._read_hook_payload(hook_offset)
             if payload is not None:
@@ -596,6 +605,19 @@ class _TuiWorker:
             if deadline is not None and time.monotonic() >= deadline:
                 await self.kill()
                 raise AskTimeout("ask timed out")
+
+            if not cr_retried and time.monotonic() >= retry_at:
+                try:
+                    await self._write_master(b"\r", deadline)
+                except AskTimeout:
+                    await self.kill()
+                    raise
+                except OSError as exc:
+                    tail = self.stderr_tail
+                    await self.kill()
+                    raise WorkerCrashError("worker exited before retry submit", tail) from exc
+                cr_retried = True
+                self._last_ask_cr_retries = 1
 
             await asyncio.sleep(0.05)
 
@@ -638,6 +660,7 @@ class _TuiWorker:
                 trust_answered = True
 
             if self._ready_marker_present():
+                self._ready_at = time.monotonic()
                 return
 
             if time.monotonic() >= deadline:
@@ -670,6 +693,23 @@ class _TuiWorker:
                 await asyncio.sleep(0.01)
                 continue
             view = view[written:]
+
+    async def _sleep_until_first_paste_ready(self, deadline: float | None) -> None:
+        settle = max(0.0, _TUI_FIRST_PASTE_SETTLE - (time.monotonic() - self._ready_at))
+        await self._sleep_with_deadline(settle, deadline)
+
+    async def _sleep_with_deadline(self, delay: float, deadline: float | None) -> None:
+        if delay <= 0:
+            return
+        if deadline is None:
+            await asyncio.sleep(delay)
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AskTimeout("ask timed out")
+        await asyncio.sleep(min(delay, remaining))
+        if time.monotonic() >= deadline:
+            raise AskTimeout("ask timed out")
 
     def _close_master(self) -> None:
         fd = self._master_fd

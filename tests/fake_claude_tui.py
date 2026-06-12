@@ -155,6 +155,7 @@ def consume_input(args: argparse.Namespace) -> None:
     pending = bytearray()
     prompt = bytearray()
     in_paste = False
+    swallow_next_submit = os.environ.get("FAKE_TUI_SWALLOW_FIRST_CR") == "1"
     while True:
         chunk = os.read(sys.stdin.fileno(), 1024)
         if not chunk:
@@ -183,6 +184,9 @@ def consume_input(args: argparse.Namespace) -> None:
                 prompt.append(byte)
             elif byte in {10, 13}:
                 if prompt:
+                    if swallow_next_submit:
+                        swallow_next_submit = False
+                        continue
                     text = prompt.decode(errors="replace")
                     prompt.clear()
                     handle_prompt(args, text)
