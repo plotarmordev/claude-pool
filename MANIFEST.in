@@ -1,5 +1,7 @@
 include CHANGELOG.md
 include PROTOCOL.md
+include PROTOCOL-TUI.md
 include tests/fake_claude.py
+include tests/fake_claude_tui.py
 recursive-include examples *.md *.py
 recursive-include tests/fixtures *.jsonl

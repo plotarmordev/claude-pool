@@ -10,19 +10,27 @@ from collections import deque
 from collections.abc import Coroutine, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, suppress
 from dataclasses import dataclass
+import errno
 import json
 import logging
 import os
+
+try:
+    import pty
+except ImportError:  # pragma: no cover - POSIX-only backend, importable on Windows.
+    pty = None
 import shutil
 import signal
 import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from types import TracebackType
 from typing import Any
+import uuid
 
 _STDOUT_LIMIT = 10 * 2**20
 _STDERR_LIMIT = 64 * 1024
@@ -329,6 +337,394 @@ class AskTimeout(ClaudePoolError):
 
 class PoolClosed(ClaudePoolError):
     """Raised when work is requested from a closed pool or session."""
+
+
+def _build_tui_argv(
+    command: Sequence[str],
+    *,
+    session_id: str,
+    settings_path: str,
+    model: str | None = None,
+    effort: str | None = None,
+    system_prompt: str | None = None,
+    allowed_tools: Sequence[str] | None = None,
+    disallowed_tools: Sequence[str] | None = None,
+    extra_args: Sequence[str] | None = None,
+) -> list[str]:
+    argv = list(command)
+    argv.extend(["--session-id", session_id, "--settings", settings_path])
+    if model is not None:
+        argv.extend(["--model", model])
+    if effort is not None:
+        argv.extend(["--effort", effort])
+    if system_prompt is not None:
+        argv.extend(["--append-system-prompt", system_prompt])
+    if allowed_tools is not None:
+        argv.extend(["--allowedTools", ",".join(allowed_tools)])
+    if disallowed_tools is not None:
+        argv.extend(["--disallowedTools", ",".join(disallowed_tools)])
+    if extra_args is not None:
+        argv.extend(extra_args)
+    return argv
+
+
+class _TuiWorker:
+    def __init__(
+        self,
+        process: asyncio.subprocess.Process,
+        master_fd: int,
+        *,
+        tempdir: str,
+        hook_path: str,
+        settings_path: str,
+        session_id: str,
+    ) -> None:
+        self.process = process
+        self._pgid = process.pid
+        _LIVE_PGIDS.add(self._pgid)
+        self._master_fd: int | None = master_fd
+        self._tempdir = tempdir
+        self._hook_path = hook_path
+        self._settings_path = settings_path
+        self._session_id = session_id
+        self.spawned_at = time.monotonic()
+        self.idle_since = self.spawned_at
+        self._pty_tail = _TailBuffer(_STDERR_LIMIT)
+        self._tail_lock = threading.Lock()
+        self._last_pty_activity = time.monotonic()
+        self._ask_lock = asyncio.Lock()
+        self._killed = False
+        self._reader_thread = threading.Thread(
+            target=self._drain_pty,
+            name="claude-pool-tui-pty-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+    @classmethod
+    async def spawn(
+        cls,
+        argv: Sequence[str],
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> _TuiWorker:
+        if os.name != "posix" or pty is None:
+            raise NotImplementedError("TUI workers require POSIX ptys")
+
+        tempdir = tempfile.mkdtemp(prefix="claude-pool-tui-")
+        hook_path = os.path.join(tempdir, "hook.ndjson")
+        settings_path = os.path.join(tempdir, "settings.json")
+        session_id = str(uuid.uuid4())
+        master_fd: int | None = None
+        slave_fd: int | None = None
+        worker: _TuiWorker | None = None
+        try:
+            with open(hook_path, "w", encoding="utf-8"):
+                pass
+            settings = {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"cat >> {hook_path}",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+            with open(settings_path, "w", encoding="utf-8") as file:
+                json.dump(settings, file, separators=(",", ":"))
+
+            master_fd, slave_fd = pty.openpty()
+            full_env = os.environ.copy()
+            full_env.update({"TERM": "xterm-256color", "COLUMNS": "120", "LINES": "40"})
+            if env is not None:
+                full_env.update(env)
+            process = await asyncio.create_subprocess_exec(
+                *_build_tui_argv(argv, session_id=session_id, settings_path=settings_path),
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=cwd if cwd is not None else tempdir,
+                env=full_env,
+                start_new_session=True,
+            )
+            os.close(slave_fd)
+            slave_fd = None
+            worker = cls(
+                process,
+                master_fd,
+                tempdir=tempdir,
+                hook_path=hook_path,
+                settings_path=settings_path,
+                session_id=session_id,
+            )
+            master_fd = None
+            await worker._wait_ready()
+            return worker
+        except BaseException:
+            if worker is not None:
+                await worker.kill()
+            else:
+                if master_fd is not None:
+                    with suppress(OSError):
+                        os.close(master_fd)
+                shutil.rmtree(tempdir, ignore_errors=True)
+            raise
+        finally:
+            if slave_fd is not None:
+                with suppress(OSError):
+                    os.close(slave_fd)
+
+    @property
+    def stderr_tail(self) -> str:
+        with self._tail_lock:
+            return self._pty_tail.text()
+
+    @property
+    def alive(self) -> bool:
+        return self.process.returncode is None
+
+    async def ask(
+        self,
+        prompt: str,
+        timeout: float | None,
+    ) -> tuple[dict[str, Any], None]:
+        if self._ask_lock.locked():
+            raise RuntimeError("worker already has an in-flight ask")
+
+        async with self._ask_lock:
+            try:
+                return await self._ask(prompt, timeout)
+            except asyncio.CancelledError:
+                await asyncio.shield(self.kill())
+                raise
+
+    async def retire(self) -> None:
+        try:
+            self._close_master()
+            if not await self._wait_process(timeout=2.0):
+                await self.kill()
+                return
+            self._mark_process_group_done()
+            self._join_reader()
+            self._cleanup_tempdir()
+        except asyncio.CancelledError:
+            await asyncio.shield(self.kill())
+            raise
+
+    async def kill(self) -> None:
+        self._signal_process_group()
+        self._close_master()
+        await self._wait_process(timeout=2.0)
+        self._join_reader()
+        self._cleanup_tempdir()
+
+    async def _ask(
+        self,
+        prompt: str,
+        timeout: float | None,
+    ) -> tuple[dict[str, Any], None]:
+        if not self.alive:
+            tail = self.stderr_tail
+            await self.kill()
+            raise WorkerCrashError("worker exited before accepting input", tail)
+
+        started = time.monotonic()
+        deadline = started + timeout if timeout is not None else None
+        try:
+            hook_offset = os.path.getsize(self._hook_path)
+        except OSError:
+            hook_offset = 0
+
+        try:
+            self._write_master(b"\x1b[200~" + prompt.encode() + b"\x1b[201~")
+            await asyncio.sleep(0.05)
+            self._write_master(b"\r")
+        except OSError as exc:
+            tail = self.stderr_tail
+            await self.kill()
+            raise WorkerCrashError("worker exited before accepting input", tail) from exc
+
+        while True:
+            payload = self._read_hook_payload(hook_offset)
+            if payload is not None:
+                self.idle_since = time.monotonic()
+                result_text = payload.get("last_assistant_message")
+                session_id = payload.get("session_id")
+                usage = await self._read_transcript_usage(payload.get("transcript_path"))
+                return (
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "result": result_text if isinstance(result_text, str) else "",
+                        "session_id": session_id if isinstance(session_id, str) else "",
+                        "usage": usage,
+                        "total_cost_usd": 0.0,
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                        "hook_payload": payload,
+                    },
+                    None,
+                )
+
+            if self.process.returncode is not None:
+                tail = self.stderr_tail
+                await self.kill()
+                raise WorkerCrashError("worker exited before result", tail)
+
+            if deadline is not None and time.monotonic() >= deadline:
+                await self.kill()
+                raise AskTimeout("ask timed out")
+
+            await asyncio.sleep(0.05)
+
+    def _drain_pty(self) -> None:
+        fd = self._master_fd
+        if fd is None:
+            return
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError as exc:
+                if exc.errno in {errno.EBADF, errno.EIO}:
+                    return
+                return
+            if not chunk:
+                return
+            with self._tail_lock:
+                self._pty_tail.append(chunk)
+                self._last_pty_activity = time.monotonic()
+
+    async def _wait_ready(self) -> None:
+        deadline = time.monotonic() + 30.0
+        trust_answered = False
+        while True:
+            if self.process.returncode is not None:
+                raise WorkerStartError("TUI worker exited during startup", self.stderr_tail)
+
+            tail = self.stderr_tail
+            lowered = tail.lower()
+            if not trust_answered and "trust" in lowered:
+                with suppress(OSError):
+                    self._write_master(b"\r")
+                trust_answered = True
+
+            if "ready" in lowered:
+                return
+            if (
+                time.monotonic() - self.spawned_at >= 1.0
+                and time.monotonic() - self._last_activity() >= 0.5
+            ):
+                return
+
+            if time.monotonic() >= deadline:
+                tail = self.stderr_tail
+                await self.kill()
+                raise WorkerStartError("TUI worker did not become ready", tail)
+
+            await asyncio.sleep(0.05)
+
+    def _last_activity(self) -> float:
+        with self._tail_lock:
+            return self._last_pty_activity
+
+    def _write_master(self, data: bytes) -> None:
+        fd = self._master_fd
+        if fd is None:
+            raise OSError(errno.EBADF, "pty master is closed")
+        os.write(fd, data)
+
+    def _close_master(self) -> None:
+        fd = self._master_fd
+        if fd is None:
+            return
+        self._master_fd = None
+        with suppress(OSError):
+            os.close(fd)
+
+    def _read_hook_payload(self, offset: int) -> dict[str, Any] | None:
+        try:
+            with open(self._hook_path, "rb") as file:
+                file.seek(offset)
+                data = file.read()
+        except OSError:
+            return None
+        if b"\n" not in data:
+            return None
+        raw_line = data.split(b"\n", 1)[0].strip()
+        if not raw_line:
+            return None
+        try:
+            payload = json.loads(raw_line.decode(errors="replace"))
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    async def _read_transcript_usage(self, transcript_path: Any) -> dict[str, Any]:
+        if not isinstance(transcript_path, str):
+            return {}
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            try:
+                with open(transcript_path, encoding="utf-8") as file:
+                    lines = file.read().splitlines()
+            except OSError:
+                await asyncio.sleep(0.05)
+                continue
+
+            for line in reversed(lines):
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                usage = message.get("usage")
+                if isinstance(usage, Mapping):
+                    return dict(usage)
+                nested = message.get("message")
+                if isinstance(nested, Mapping):
+                    usage = nested.get("usage")
+                    if isinstance(usage, Mapping):
+                        return dict(usage)
+            return {}
+        return {}
+
+    async def _wait_process(self, timeout: float) -> bool:
+        if self.process.returncode is not None:
+            return True
+        waiter = asyncio.create_task(self.process.wait())
+        try:
+            done, _pending = await asyncio.wait({waiter}, timeout=timeout)
+            return waiter in done
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+                with suppress(asyncio.CancelledError):
+                    await waiter
+
+    def _signal_process_group(self) -> None:
+        if not self._killed:
+            self._killed = True
+            try:
+                os.killpg(self._pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _LIVE_PGIDS.discard(self._pgid)
+
+    def _mark_process_group_done(self) -> None:
+        self._killed = True
+        _LIVE_PGIDS.discard(self._pgid)
+
+    def _join_reader(self) -> None:
+        self._reader_thread.join(timeout=1.0)
+
+    def _cleanup_tempdir(self) -> None:
+        shutil.rmtree(self._tempdir, ignore_errors=True)
 
 
 class Session:
