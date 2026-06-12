@@ -38,7 +38,7 @@ Spawning plain `claude` (NO `-p`) in a pty with `--session-id <uuid>` and
   vs pipe-holding children. Verify on /tmp/pool-venv-310, /tmp/pool-venv-311,
   /tmp/pool-test-venv before every commit.
 
-## Task 61: v0.1 hygiene (claude_pool.py, PROTOCOL.md, README.md, tests)
+### Task 61: v0.1 hygiene (claude_pool.py, PROTOCOL.md, README.md, tests)
 
 1. Daemon ask response gains `rate_limit` and `duration_ms` (keep wire compat: add
    fields, never remove). `status` response gains `backend`.
@@ -53,7 +53,7 @@ Spawning plain `claude` (NO `-p`) in a pty with `--session-id <uuid>` and
    branch on it.
 6. Commit: `fix: daemon metadata, client timeouts, protocol fixtures, README honesty`.
 
-## Task 62: TUI worker (claude_pool.py, tests/fake_claude_tui.py, tests/test_tui_worker.py)
+### Task 62: TUI worker (claude_pool.py, tests/fake_claude_tui.py, tests/test_tui_worker.py)
 
 1. `_TuiWorker.spawn(argv_profile, cwd, env)`:
    - `pty.openpty()`; spawn `claude --session-id <uuid4> [--model M] [--effort E]
@@ -93,7 +93,7 @@ Spawning plain `claude` (NO `-p`) in a pty with `--session-id <uuid>` and
    lag, CLI version pinned).
 7. Commit: `feat: TUI worker — pty + stop-hook turns, no print mode`.
 
-## Task 63: backend wiring + release 0.2.0 (claude_pool.py, README, CHANGELOG, examples)
+### Task 63: backend wiring + release 0.2.0 (claude_pool.py, README, CHANGELOG, examples)
 
 1. `ClaudePool(backend=...)` validated at construction; worker factory dispatches;
    everything else (warm pool, sessions, sync mirrors, daemon) backend-agnostic.
