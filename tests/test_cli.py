@@ -306,6 +306,96 @@ def test_sigterm_gracefully_stops_server_and_workers(tmp_path: Path) -> None:
         wait_for_no_fake_processes()
 
 
+def test_sigterm_with_idle_client_exits_and_unlinks_socket(tmp_path: Path) -> None:
+    process, socket_path = start_server(tmp_path, "--warm", "0")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.connect(str(socket_path))
+        process.terminate()
+        assert process.wait(timeout=10.0) == 0
+
+        assert not socket_path.exists()
+        wait_for_no_fake_processes()
+    finally:
+        client.close()
+        stop_server(process)
+        wait_for_no_fake_processes()
+
+
+def test_live_socket_is_not_taken_over_and_regular_file_is_preserved(tmp_path: Path) -> None:
+    first, socket_path = start_server(tmp_path, "--warm", "0")
+    second = subprocess.Popen(
+        cli_args(
+            "serve",
+            "--socket",
+            str(socket_path),
+            "--claude-bin",
+            str(FAKE),
+            "--warm",
+            "0",
+        ),
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _stdout, stderr = second.communicate(timeout=5.0)
+
+        assert second.returncode == 1
+        assert "already serving" in stderr
+
+        completed = run_cli(["status", "--socket", str(socket_path)])
+        assert completed.returncode == 0
+        assert f"pid: {first.pid}" in completed.stdout
+    finally:
+        stop_server(second)
+        stop_server(first)
+        wait_for_no_fake_processes()
+
+    not_socket = tmp_path / "not-a-socket"
+    not_socket.write_text("keep me")
+    completed = run_cli(
+        ["serve", "--socket", str(not_socket), "--claude-bin", str(FAKE)],
+        timeout=10.0,
+    )
+
+    assert completed.returncode == 1
+    assert "not a socket" in completed.stderr
+    assert not_socket.read_text() == "keep me"
+
+
+def test_serve_bind_error_is_single_line_without_traceback(tmp_path: Path) -> None:
+    missing_parent = tmp_path / "missing" / "x.sock"
+    completed = run_cli(
+        ["serve", "--socket", str(missing_parent), "--claude-bin", str(FAKE)],
+        timeout=10.0,
+    )
+
+    stderr_lines = completed.stderr.strip().splitlines()
+    assert completed.returncode == 1
+    assert len(stderr_lines) == 1
+    assert "cannot bind" in stderr_lines[0]
+    assert "Traceback" not in completed.stderr
+
+
+def test_bad_request_for_nonpositive_timeout_and_nonstring_op(tmp_path: Path) -> None:
+    process, socket_path = start_server(tmp_path, "--warm", "0")
+    try:
+        timeout_response = request(socket_path, {"op": "ask", "prompt": "x", "timeout": 0})
+        op_response = request(socket_path, {"op": 7})
+
+        assert timeout_response["ok"] is False
+        assert timeout_response["kind"] == "BadRequest"
+        assert timeout_response["error"] == "timeout must be positive"
+        assert op_response["ok"] is False
+        assert op_response["kind"] == "BadRequest"
+        assert op_response["error"] == "op must be a string"
+    finally:
+        stop_server(process)
+        wait_for_no_fake_processes()
+
+
 def test_doctor_missing_binary_reports_diagnosis() -> None:
     completed = run_cli(["doctor", "--claude-bin", "/nonexistent/claude"], timeout=10.0)
     combined = completed.stdout + completed.stderr

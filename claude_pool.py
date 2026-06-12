@@ -16,6 +16,7 @@ import os
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -1022,7 +1023,37 @@ def _request_timeout(value: Any) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError("timeout must be a number")
-    return float(value)
+    timeout = float(value)
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    return timeout
+
+
+def _prepare_socket_path(socket_path: str) -> bool:
+    try:
+        mode = os.stat(socket_path).st_mode
+    except FileNotFoundError:
+        return True
+
+    if not stat.S_ISSOCK(mode):
+        print(
+            f"claude-pool serve: cannot bind {socket_path}: path is not a socket", file=sys.stderr
+        )
+        return False
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1.0)
+        try:
+            probe.connect(socket_path)
+        except OSError:
+            os.unlink(socket_path)
+            return True
+
+    print(
+        f"another claude-pool daemon is already serving on {socket_path}",
+        file=sys.stderr,
+    )
+    return False
 
 
 async def _write_response(
@@ -1038,6 +1069,7 @@ async def _run_serve(args: argparse.Namespace) -> int:
     pool = ClaudePool(**_pool_kwargs_from_args(args))
     profile = _profile_from_args(args)
     in_flight = 0
+    connections: set[asyncio.Task[Any]] = set()
 
     async def handle_request(line: bytes) -> dict[str, Any]:
         nonlocal in_flight
@@ -1049,6 +1081,8 @@ async def _run_serve(args: argparse.Namespace) -> int:
             return _error_response("BadRequest", "request must be a JSON object")
 
         op = request.get("op")
+        if "op" in request and not isinstance(op, str):
+            return _error_response("BadRequest", "op must be a string")
         if op == "ask":
             prompt = request.get("prompt")
             if not isinstance(prompt, str):
@@ -1083,6 +1117,9 @@ async def _run_serve(args: argparse.Namespace) -> int:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            connections.add(task)
         try:
             while True:
                 try:
@@ -1097,17 +1134,25 @@ async def _run_serve(args: argparse.Namespace) -> int:
                     break
                 response = await handle_request(line)
                 await _write_response(writer, response)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug("client disconnected during response")
         except Exception as exc:
             logger.exception("client handler failed")
             with suppress(Exception):
                 await _write_response(writer, _error_response(type(exc).__name__, str(exc)))
         finally:
+            if task is not None:
+                connections.discard(task)
             writer.close()
             with suppress(Exception):
                 await writer.wait_closed()
 
-    with suppress(FileNotFoundError):
-        os.unlink(socket_path)
+    try:
+        if not _prepare_socket_path(socket_path):
+            return 1
+    except OSError as exc:
+        print(f"claude-pool serve: cannot bind {socket_path}: {exc.strerror}", file=sys.stderr)
+        return 1
 
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1115,17 +1160,29 @@ async def _run_serve(args: argparse.Namespace) -> int:
         with suppress(NotImplementedError):
             loop.add_signal_handler(sig, shutdown.set)
 
-    server = await asyncio.start_unix_server(
-        handle_client,
-        path=socket_path,
-        limit=_STDOUT_LIMIT,
-    )
+    old_umask = os.umask(0o177)
+    try:
+        server = await asyncio.start_unix_server(
+            handle_client,
+            path=socket_path,
+            limit=_STDOUT_LIMIT,
+        )
+    except OSError as exc:
+        print(f"claude-pool serve: cannot bind {socket_path}: {exc.strerror}", file=sys.stderr)
+        return 1
+    finally:
+        os.umask(old_umask)
     os.chmod(socket_path, 0o600)
     try:
         await pool.start()
         await shutdown.wait()
     finally:
         server.close()
+        tasks = tuple(connections)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await server.wait_closed()
         await pool.aclose()
         with suppress(FileNotFoundError):
