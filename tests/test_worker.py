@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import os
 import shlex
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from claude_pool import AskTimeout, Result, WorkerCrashError, _TailBuffer, _Worker
 
@@ -43,14 +46,14 @@ async def spawn_fake(
     return await _Worker.spawn(argv or fake_argv(), env=full_env)
 
 
-def assert_process_group_gone(pgid: int) -> None:
+async def assert_process_group_gone(pgid: int) -> None:
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         try:
             os.killpg(pgid, 0)
         except ProcessLookupError:
             return
-        time.sleep(0.05)
+        await asyncio.sleep(0.05)
     raise AssertionError(f"process group {pgid} still exists")
 
 
@@ -172,7 +175,39 @@ def test_worker_timeout_kills_entire_process_group() -> None:
             await worker.kill()
 
         assert worker.alive is False
-        assert_process_group_gone(pgid)
+        await assert_process_group_gone(pgid)
+
+    run(scenario())
+
+
+def test_worker_cancellation_mid_ask_kills_process_group() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake()
+        pgid = os.getpgid(worker.process.pid)
+        task = asyncio.create_task(worker.ask("SLEEP:30", timeout=None))
+        await asyncio.sleep(0.3)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await assert_process_group_gone(pgid)
+
+    run(scenario())
+
+
+def test_worker_concurrent_second_ask_raises_runtime_error() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake()
+        first = asyncio.create_task(worker.ask("SLEEP:2", timeout=5.0))
+        await asyncio.sleep(0.3)
+
+        try:
+            with pytest.raises(RuntimeError):
+                await worker.ask("second", timeout=5.0)
+        finally:
+            await worker.kill()
+            with suppress(WorkerCrashError, AskTimeout):
+                await first
 
     run(scenario())
 
@@ -187,6 +222,37 @@ def test_worker_startup_auth_error_carries_login_stderr() -> None:
                 assert "Please run /login" in exc.stderr_tail
             else:
                 raise AssertionError("expected WorkerCrashError")
+        finally:
+            await worker.kill()
+
+    run(scenario())
+
+
+def test_worker_retire_kills_pipe_holding_child() -> None:
+    async def scenario() -> None:
+        quoted = " ".join(shlex.quote(arg) for arg in fake_argv())
+        argv = ["/bin/sh", "-c", f"sleep 30 & exec {quoted}"]
+        worker = await spawn_fake(argv=argv)
+        pgid = os.getpgid(worker.process.pid)
+
+        result_message, _rate_limit = await worker.ask("hello", timeout=5.0)
+        start = time.monotonic()
+        await worker.retire()
+
+        assert result_message["type"] == "result"
+        assert time.monotonic() - start < 5.0
+        await assert_process_group_gone(pgid)
+
+    run(scenario())
+
+
+def test_worker_oversized_output_line_crashes_worker_cleanly() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake()
+        try:
+            with pytest.raises(WorkerCrashError, match="oversized output line"):
+                await worker.ask("BIGLINE:11000000", timeout=10.0)
+            assert worker.alive is False
         finally:
             await worker.kill()
 

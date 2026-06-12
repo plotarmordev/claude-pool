@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
 import json
 import os
@@ -84,6 +84,7 @@ class _TailBuffer:
 class _Worker:
     def __init__(self, process: asyncio.subprocess.Process) -> None:
         self.process = process
+        self._pgid = process.pid
         self.spawned_at = time.monotonic()
         self.idle_since = self.spawned_at
         self._stderr = _TailBuffer(_STDERR_LIMIT)
@@ -132,22 +133,32 @@ class _Worker:
             except asyncio.TimeoutError as exc:
                 await self.kill()
                 raise AskTimeout("ask timed out") from exc
+            except asyncio.CancelledError:
+                await asyncio.shield(self.kill())
+                raise
 
     async def retire(self) -> None:
-        if self.process.stdin is not None and not self.process.stdin.is_closing():
-            self.process.stdin.close()
-            await self.process.stdin.wait_closed()
         try:
-            await asyncio.wait_for(self.process.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
-            await self.kill()
-        await self._finish_stderr_task(cancel=False)
+            try:
+                await asyncio.wait_for(self._close_stdin(), timeout=2.0)
+            except asyncio.TimeoutError:
+                await self.kill()
+                return
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                await self.kill()
+                return
+            await self._finish_stderr_task(cancel=False)
+        except asyncio.CancelledError:
+            await asyncio.shield(self.kill())
+            raise
 
     async def kill(self) -> None:
-        if not self._killed and self.process.returncode is None:
+        if not self._killed:
             self._killed = True
             try:
-                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                os.killpg(self._pgid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
         try:
@@ -172,7 +183,7 @@ class _Worker:
             self.process.stdin.write(line)
             await self.process.stdin.drain()
         except (BrokenPipeError, ConnectionResetError) as exc:
-            await self.process.wait()
+            await self._wait_after_crash()
             await self._finish_stderr_task(cancel=False)
             raise WorkerCrashError(
                 "worker exited before accepting input", self.stderr_tail
@@ -180,9 +191,15 @@ class _Worker:
 
         rate_limit: dict[str, Any] | None = None
         while True:
-            raw = await self.process.stdout.readline()
+            try:
+                raw = await self.process.stdout.readline()
+            except (ValueError, asyncio.LimitOverrunError) as exc:
+                await self.kill()
+                raise WorkerCrashError(
+                    "oversized output line", stderr_tail=self.stderr_tail
+                ) from exc
             if raw == b"":
-                await self.process.wait()
+                await self._wait_after_crash()
                 await self._finish_stderr_task(cancel=False)
                 raise WorkerCrashError("worker exited before result", stderr_tail=self.stderr_tail)
 
@@ -209,18 +226,37 @@ class _Worker:
                 return
             self._stderr.append(chunk)
 
+    async def _close_stdin(self) -> None:
+        if self.process.stdin is None or self.process.stdin.is_closing():
+            return
+        self.process.stdin.close()
+        with suppress(BrokenPipeError, ConnectionResetError):
+            await self.process.stdin.wait_closed()
+
+    async def _wait_after_crash(self) -> None:
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            await self.kill()
+
     async def _finish_stderr_task(self, *, cancel: bool) -> None:
-        if cancel and not self._stderr_task.done():
-            self._stderr_task.cancel()
+        if cancel:
+            await self._cancel_stderr_task()
+            return
+
         try:
             await asyncio.wait_for(self._stderr_task, timeout=1.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            if not self._stderr_task.done():
-                self._stderr_task.cancel()
-                try:
-                    await self._stderr_task
-                except asyncio.CancelledError:
-                    pass
+        except asyncio.TimeoutError:
+            await self._cancel_stderr_task()
+        except asyncio.CancelledError:
+            await self._cancel_stderr_task()
+            raise
+
+    async def _cancel_stderr_task(self) -> None:
+        if not self._stderr_task.done():
+            self._stderr_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._stderr_task
 
 
 class ClaudePoolError(Exception):

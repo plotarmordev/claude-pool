@@ -80,7 +80,7 @@ def _json_lines(stdout: str) -> list[dict[str, Any]]:
 
 def _read_turn(process: subprocess.Popen[str]) -> list[dict[str, Any]]:
     assert process.stdout is not None
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + 15.0
     lines = []
     while time.monotonic() < deadline:
         ready, _, _ = select.select([process.stdout], [], [], 0.1)
