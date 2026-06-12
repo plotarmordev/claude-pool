@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 import socket
@@ -158,6 +159,20 @@ def test_serve_and_ask_round_trip(tmp_path: Path) -> None:
         wait_for_no_fake_processes()
 
 
+def test_ask_response_includes_duration_and_rate_limit(tmp_path: Path) -> None:
+    process, socket_path = start_server(tmp_path, "--warm", "0")
+    try:
+        response = request(socket_path, {"op": "ask", "prompt": "RATELIMIT"})
+
+        assert response["ok"] is True
+        assert response["duration_ms"] == 12
+        assert response["rate_limit"]["type"] == "rate_limit_event"
+        assert response["rate_limit"]["retry_after_ms"] == 250
+    finally:
+        stop_server(process)
+        wait_for_no_fake_processes()
+
+
 def test_raw_connection_handles_two_sequential_asks(tmp_path: Path) -> None:
     process, socket_path = start_server(tmp_path, "--warm", "0")
     try:
@@ -277,6 +292,7 @@ def test_status_reports_warm_pid_and_profile(tmp_path: Path) -> None:
 
         assert int(status["warm"]) >= 1
         assert int(status["pid"]) == process.pid
+        assert status["backend"] == "stream-json"
         assert status["profile.claude_bin"] == str(FAKE)
     finally:
         stop_server(process)
@@ -422,3 +438,19 @@ def test_ask_without_server_fails_helpfully(tmp_path: Path) -> None:
 
     assert completed.returncode == 1
     assert "failed to contact claude-pool server" in completed.stderr
+
+
+def test_client_socket_timeout_prints_clean_error(monkeypatch: Any, capsys: Any) -> None:
+    import claude_pool
+
+    def raise_timeout(*_args: Any) -> dict[str, Any]:
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(claude_pool, "_send_client_request", raise_timeout)
+
+    code = claude_pool._run_client_status(argparse.Namespace(socket="/tmp/missing.sock"))
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err == "timed out contacting claude-pool server\n"

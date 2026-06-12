@@ -129,6 +129,22 @@ gets a fresh context. `Session` keeps one checked-out worker for the context
 manager lifetime, so the Claude CLI process carries conversation state across
 turns.
 
+## How this relates to `claude -p`
+
+The current stream-json backend is Claude Code print mode kept warm:
+
+```text
+claude -p --input-format stream-json --output-format stream-json --verbose
+```
+
+It uses the same CLI flags, same local Claude Code login, same account, and
+same limits as running `claude -p` yourself. The difference is process
+lifecycle: `claude-pool` starts workers ahead of time and reuses a checked-out
+process for exactly one plain `ask()` or for the lifetime of an explicit
+`Session`.
+
+A TUI backend that does not use print mode is planned for v0.2.
+
 ## Result Fields
 
 `ask()` and `Session.send()` return `Result`:
@@ -136,7 +152,7 @@ turns.
 | Field | Meaning |
 | --- | --- |
 | `text` | The CLI result text. |
-| `is_error` | Whether Claude Code marked the result as an error. |
+| `is_error` | Whether Claude Code marked the result as an error. This is returned as a normal `Result`, not raised. |
 | `subtype` | The CLI result subtype. |
 | `session_id` | The worker session id reported by Claude Code. |
 | `usage` | Token and cache usage reported by Claude Code. |
@@ -144,6 +160,9 @@ turns.
 | `duration_ms` | Reported turn duration. |
 | `rate_limit` | Latest rate-limit event seen during the turn, if any. |
 | `raw` | The original result message. |
+
+Branch on `result.is_error` before treating `result.text` as ordinary model
+output. Claude Code can put error text in the same field as successful output.
 
 ## Exceptions
 
