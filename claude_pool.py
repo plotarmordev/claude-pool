@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import atexit
 import asyncio
+from collections import deque
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
 import json
+import logging
 import os
 import signal
 import sys
@@ -16,6 +19,19 @@ from typing import Any
 
 _STDOUT_LIMIT = 10 * 2**20
 _STDERR_LIMIT = 64 * 1024
+_LIVE_PGIDS: set[int] = set()
+logger = logging.getLogger("claude_pool")
+
+
+def _kill_live_process_groups() -> None:
+    for pgid in tuple(_LIVE_PGIDS):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+atexit.register(_kill_live_process_groups)
 
 
 @dataclass(frozen=True)
@@ -85,6 +101,7 @@ class _Worker:
     def __init__(self, process: asyncio.subprocess.Process) -> None:
         self.process = process
         self._pgid = process.pid
+        _LIVE_PGIDS.add(self._pgid)
         self.spawned_at = time.monotonic()
         self.idle_since = self.spawned_at
         self._stderr = _TailBuffer(_STDERR_LIMIT)
@@ -170,6 +187,7 @@ class _Worker:
                 os.killpg(self._pgid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            _LIVE_PGIDS.discard(self._pgid)
 
     async def _ask(self, prompt: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if self.process.stdin is None or self.process.stdout is None:
@@ -362,11 +380,90 @@ class ClaudePool:
         max_idle: float = 900.0,
         default_timeout: float = 600.0,
     ) -> None:
-        """Create a pool configuration without starting workers.
+        """Create a pool configuration without starting workers."""
+        self._argv = self._build_argv(
+            claude_bin=claude_bin,
+            model=model,
+            effort=effort,
+            system_prompt=system_prompt,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+            permission_mode=permission_mode,
+            extra_args=extra_args,
+        )
+        self._cwd = cwd
+        self._env = os.environ.copy()
+        if env is not None:
+            self._env.update(env)
+        self._warm_target = max(0, warm)
+        self._max_workers = max(1, max_workers)
+        self._max_idle = max_idle
+        self._default_timeout = default_timeout
+        self._warm: deque[_Worker] = deque()
+        self._semaphore = asyncio.Semaphore(self._max_workers)
+        self._closed = False
+        self._started = False
+        self._spawns_in_flight = 0
+        self._spawn_cooldown_until = 0.0
+        self._replenish_event = asyncio.Event()
+        self._replenish_lock = asyncio.Lock()
+        self._replenisher_task: asyncio.Task[None] | None = None
+        self._sweeper_task: asyncio.Task[None] | None = None
+        self._reaper_tasks: set[asyncio.Task[None]] = set()
 
-        Raises ``NotImplementedError`` until worker behavior is implemented.
+    @staticmethod
+    def _build_argv(
+        *,
+        claude_bin: str,
+        model: str | None,
+        effort: str | None,
+        system_prompt: str | None,
+        allowed_tools: Sequence[str] | None,
+        disallowed_tools: Sequence[str] | None,
+        permission_mode: str | None,
+        extra_args: Sequence[str] | None,
+    ) -> list[str]:
+        argv = [
+            claude_bin,
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]
+        if model is not None:
+            argv.extend(["--model", model])
+        if effort is not None:
+            argv.extend(["--effort", effort])
+        if system_prompt is not None:
+            argv.extend(["--system-prompt", system_prompt])
+        if allowed_tools is not None:
+            argv.extend(["--allowedTools", ",".join(allowed_tools)])
+        if disallowed_tools is not None:
+            argv.extend(["--disallowedTools", ",".join(disallowed_tools)])
+        if permission_mode is not None:
+            argv.extend(["--permission-mode", permission_mode])
+        if extra_args is not None:
+            argv.extend(extra_args)
+        return argv
+
+    async def start(self) -> None:
+        """Start background pool maintenance and pre-warm configured workers.
+
+        Raises ``PoolClosed`` when called after the pool has closed.
         """
-        raise NotImplementedError
+        if self._closed:
+            raise PoolClosed("pool is closed")
+        self._ensure_started()
+        await self._replenish_once()
+
+    def _ensure_started(self) -> None:
+        if not self._started:
+            self._started = True
+            self._replenisher_task = asyncio.create_task(self._replenisher())
+            self._sweeper_task = asyncio.create_task(self._sweeper())
+            self._replenish_event.set()
 
     async def ask(self, prompt: str, timeout: float | None = None) -> Result:
         """Send one prompt in a fresh context and return the completed result.
@@ -374,7 +471,18 @@ class ClaudePool:
         Raises ``AskTimeout`` if the timeout elapses, ``WorkerCrashError`` if a
         worker exits mid-turn, and ``PoolClosed`` when the pool has closed.
         """
-        raise NotImplementedError
+        if self._closed:
+            raise PoolClosed("pool is closed")
+        self._ensure_started()
+        ask_timeout = self._default_timeout if timeout is None else timeout
+        await self._semaphore.acquire()
+        if self._closed:
+            self._semaphore.release()
+            raise PoolClosed("pool is closed")
+        try:
+            return await self._ask_with_worker(prompt, ask_timeout)
+        finally:
+            self._semaphore.release()
 
     def session(self) -> AbstractAsyncContextManager[Session]:
         """Return an async context manager yielding a multi-turn ``Session``.
@@ -388,7 +496,28 @@ class ClaudePool:
 
         After this method completes, new work raises ``PoolClosed``.
         """
-        raise NotImplementedError
+        if self._closed:
+            return
+        self._closed = True
+        tasks = [task for task in (self._replenisher_task, self._sweeper_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        acquired = 0
+        for _ in range(self._max_workers):
+            await self._semaphore.acquire()
+            acquired += 1
+        async with self._replenish_lock:
+            warm = list(self._warm)
+            self._warm.clear()
+        for worker in warm:
+            self._reap(worker)
+        if self._reaper_tasks:
+            await asyncio.gather(*self._reaper_tasks, return_exceptions=True)
+        for _ in range(acquired):
+            self._semaphore.release()
 
     def ask_sync(self, prompt: str, timeout: float | None = None) -> Result:
         """Synchronously send one prompt in a fresh context.
@@ -403,7 +532,8 @@ class ClaudePool:
 
     async def __aenter__(self) -> ClaudePool:
         """Enter this async pool context and return the pool."""
-        raise NotImplementedError
+        await self.start()
+        return self
 
     async def __aexit__(
         self,
@@ -412,7 +542,132 @@ class ClaudePool:
         tb: TracebackType | None,
     ) -> bool | None:
         """Close the pool when leaving an async context."""
-        raise NotImplementedError
+        await self.aclose()
+        return None
+
+    async def _ask_with_worker(self, prompt: str, timeout: float | None) -> Result:
+        retried_warm_crash = False
+        force_cold = False
+        while True:
+            if force_cold:
+                worker, was_warm = await self._spawn_worker(), False
+            else:
+                worker, was_warm = await self._checkout_worker()
+            try:
+                result_message, rate_limit = await worker.ask(prompt, timeout)
+                return Result.from_result_message(result_message, rate_limit)
+            except WorkerCrashError:
+                if was_warm and not retried_warm_crash:
+                    retried_warm_crash = True
+                    force_cold = True
+                    continue
+                raise
+            finally:
+                self._reap(worker)
+                self._nudge_replenisher()
+
+    async def _checkout_worker(self) -> tuple[_Worker, bool]:
+        while self._warm:
+            worker = self._warm.pop()
+            if not worker.alive:
+                self._reap(worker, kill=True)
+                continue
+            if time.monotonic() - worker.idle_since > self._max_idle:
+                self._reap(worker)
+                continue
+            return worker, True
+        return await self._spawn_worker(), False
+
+    async def _spawn_worker(self) -> _Worker:
+        try:
+            return await _Worker.spawn(self._argv, cwd=self._cwd, env=self._env)
+        except OSError as exc:
+            raise WorkerStartError(str(exc)) from exc
+
+    async def _replenisher(self) -> None:
+        while True:
+            waiter = asyncio.create_task(self._replenish_event.wait())
+            try:
+                await asyncio.wait({waiter}, timeout=1.0)
+            finally:
+                waiter.cancel()
+                with suppress(asyncio.CancelledError):
+                    await waiter
+            self._replenish_event.clear()
+            self._discard_dead_warm()
+            await self._replenish_once()
+
+    async def _replenish_once(self) -> None:
+        async with self._replenish_lock:
+            while not self._closed and len(self._warm) + self._spawns_in_flight < self._warm_target:
+                cooldown_remaining = self._spawn_cooldown_until - time.monotonic()
+                if cooldown_remaining > 0:
+                    return
+                self._spawns_in_flight += 1
+                worker: _Worker | None = None
+                try:
+                    worker = await self._spawn_worker()
+                    await asyncio.sleep(0.5)
+                    if not worker.alive:
+                        error = WorkerStartError(
+                            "warm worker exited during startup",
+                            stderr_tail=worker.stderr_tail,
+                        )
+                        logger.warning("%s", error)
+                        self._spawn_cooldown_until = time.monotonic() + 30.0
+                        await worker.kill()
+                        return
+                    if self._closed:
+                        self._reap(worker)
+                    else:
+                        self._warm.append(worker)
+                except asyncio.CancelledError:
+                    if worker is not None:
+                        await worker.kill()
+                    raise
+                except WorkerStartError as exc:
+                    logger.warning("%s", exc)
+                    self._spawn_cooldown_until = time.monotonic() + 30.0
+                    return
+                finally:
+                    self._spawns_in_flight -= 1
+
+    def _nudge_replenisher(self) -> None:
+        if self._started and not self._closed:
+            self._replenish_event.set()
+
+    async def _sweeper(self) -> None:
+        while True:
+            await asyncio.sleep(60.0)
+            await self._retire_expired_warm()
+
+    async def _retire_expired_warm(self) -> None:
+        kept: deque[_Worker] = deque()
+        now = time.monotonic()
+        while self._warm:
+            worker = self._warm.popleft()
+            if not worker.alive:
+                self._reap(worker, kill=True)
+            elif now - worker.idle_since > self._max_idle:
+                self._reap(worker)
+            else:
+                kept.append(worker)
+        self._warm = kept
+
+    def _discard_dead_warm(self) -> None:
+        kept: deque[_Worker] = deque()
+        while self._warm:
+            worker = self._warm.popleft()
+            if worker.alive:
+                kept.append(worker)
+            else:
+                self._reap(worker, kill=True)
+        self._warm = kept
+
+    def _reap(self, worker: _Worker, *, kill: bool = False) -> None:
+        task = asyncio.create_task(worker.kill() if kill else worker.retire())
+        self._reaper_tasks.add(task)
+        task.add_done_callback(self._reaper_tasks.discard)
 
     def __enter__(self) -> ClaudePool:
         """Enter this synchronous pool context and return the pool."""
