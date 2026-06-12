@@ -7,7 +7,7 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 import sys
 from types import TracebackType
-from typing import Any, Self
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -83,7 +83,7 @@ class Session:
         """
         raise NotImplementedError
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> Session:
         """Enter this async session context and return the session."""
         raise NotImplementedError
 
@@ -161,7 +161,7 @@ class ClaudePool:
         """Synchronously close the pool and release all workers."""
         raise NotImplementedError
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> ClaudePool:
         """Enter this async pool context and return the pool."""
         raise NotImplementedError
 
@@ -174,7 +174,7 @@ class ClaudePool:
         """Close the pool when leaving an async context."""
         raise NotImplementedError
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> ClaudePool:
         """Enter this synchronous pool context and return the pool."""
         raise NotImplementedError
 

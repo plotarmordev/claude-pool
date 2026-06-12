@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -77,6 +78,23 @@ def _json_lines(stdout: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in stdout.splitlines()]
 
 
+def _read_turn(process: subprocess.Popen[str]) -> list[dict[str, Any]]:
+    assert process.stdout is not None
+    deadline = time.monotonic() + 5.0
+    lines = []
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([process.stdout], [], [], 0.1)
+        if not ready:
+            continue
+        line = process.stdout.readline()
+        assert line
+        message = json.loads(line)
+        lines.append(message)
+        if message["type"] == "result":
+            return lines
+    raise AssertionError("timed out waiting for result")
+
+
 def test_default_echo_emits_schema_faithful_turn_and_exits_zero() -> None:
     completed = _run_fake(["hello"])
 
@@ -101,13 +119,64 @@ def test_default_echo_emits_schema_faithful_turn_and_exits_zero() -> None:
 
 def test_constant_session_id_per_process_and_incrementing_turns() -> None:
     completed = _run_fake(["one", "two"])
+    other_completed = _run_fake(["other"])
 
     assert completed.returncode == 0
+    assert other_completed.returncode == 0
     results = [line for line in _json_lines(completed.stdout) if line["type"] == "result"]
+    other_result = _json_lines(other_completed.stdout)[-1]
     assert len(results) == 2
     assert results[0]["session_id"] == results[1]["session_id"]
+    assert results[0]["session_id"] != other_result["session_id"]
     assert [result["num_turns"] for result in results] == [1, 2]
     assert [result["result"] for result in results] == ["one", "two"]
+
+
+def test_fake_idles_until_stdin_message_and_reuses_interactive_session() -> None:
+    full_env = os.environ.copy()
+    full_env["FAKE_CLAUDE_STARTUP"] = "ok"
+    process = subprocess.Popen(
+        [sys.executable, str(FAKE), "-p", "--input-format", "stream-json"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=full_env,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+
+    try:
+        ready, _, _ = select.select([process.stdout], [], [], 0.3)
+        assert ready == []
+        assert process.poll() is None
+
+        process.stdin.write(f"{_user('first')}\n")
+        process.stdin.flush()
+        first_turn = _read_turn(process)
+
+        process.stdin.write(f"{_user('second')}\n")
+        process.stdin.flush()
+        second_turn = _read_turn(process)
+
+        first_init = first_turn[0]
+        second_init = second_turn[0]
+        first_result = first_turn[-1]
+        second_result = second_turn[-1]
+        assert first_init["type"] == "system"
+        assert first_init["subtype"] == "init"
+        assert second_init["type"] == "system"
+        assert second_init["subtype"] == "init"
+        assert first_result["session_id"] == second_result["session_id"]
+        assert first_result["result"] == "first"
+        assert second_result["result"] == "second"
+
+        process.stdin.close()
+        assert process.wait(timeout=5.0) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5.0)
 
 
 def test_startup_exit2_exits_immediately() -> None:
