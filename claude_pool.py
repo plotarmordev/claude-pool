@@ -983,6 +983,8 @@ def _result_response(result: Result) -> dict[str, Any]:
         "session_id": result.session_id,
         "usage": dict(result.usage),
         "cost_usd": result.cost_usd,
+        "duration_ms": result.duration_ms,
+        "rate_limit": dict(result.rate_limit) if result.rate_limit is not None else None,
     }
 
 
@@ -1105,6 +1107,7 @@ async def _run_serve(args: argparse.Namespace) -> int:
                 "ok": True,
                 "warm": len(pool._warm),
                 "in_flight": in_flight,
+                "backend": "stream-json",
                 "profile": profile,
                 "pid": os.getpid(),
             }
@@ -1190,8 +1193,13 @@ async def _run_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def _send_client_request(socket_path: str, request: Mapping[str, Any]) -> dict[str, Any]:
+def _send_client_request(
+    socket_path: str,
+    request: Mapping[str, Any],
+    timeout: float,
+) -> dict[str, Any]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(timeout)
         client.connect(socket_path)
         with client.makefile("rwb") as file:
             file.write(_json_line(request))
@@ -1211,7 +1219,10 @@ def _run_client_ask(args: argparse.Namespace) -> int:
     if args.timeout is not None:
         request["timeout"] = args.timeout
     try:
-        response = _send_client_request(socket_path, request)
+        response = _send_client_request(socket_path, request, (args.timeout or 600.0) + 10.0)
+    except socket.timeout:
+        print("timed out contacting claude-pool server", file=sys.stderr)
+        return 1
     except (OSError, json.JSONDecodeError, RuntimeError) as exc:
         print(f"failed to contact claude-pool server: {exc}", file=sys.stderr)
         return 1
@@ -1228,7 +1239,10 @@ def _run_client_ask(args: argparse.Namespace) -> int:
 def _run_client_status(args: argparse.Namespace) -> int:
     socket_path = args.socket or _default_socket_path()
     try:
-        response = _send_client_request(socket_path, {"op": "status"})
+        response = _send_client_request(socket_path, {"op": "status"}, 10.0)
+    except socket.timeout:
+        print("timed out contacting claude-pool server", file=sys.stderr)
+        return 1
     except (OSError, json.JSONDecodeError, RuntimeError) as exc:
         print(f"failed to contact claude-pool server: {exc}", file=sys.stderr)
         return 1
@@ -1239,6 +1253,7 @@ def _run_client_status(args: argparse.Namespace) -> int:
 
     print(f"warm: {response.get('warm')}")
     print(f"in_flight: {response.get('in_flight')}")
+    print(f"backend: {response.get('backend')}")
     print(f"pid: {response.get('pid')}")
     profile = response.get("profile")
     if isinstance(profile, Mapping):

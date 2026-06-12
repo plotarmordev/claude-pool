@@ -8,8 +8,8 @@ claude -p --input-format stream-json --output-format stream-json --verbose [prof
 
 Everything below was observed live against **Claude Code 2.1.175** (Linux/arm64,
 Raspberry Pi 5) on 2026-06-12. This mode is CLI-internal and may drift between
-releases; `tests/fixtures/` pins sanitized real captures, and `claude-pool doctor`
-checks your installed CLI end to end.
+releases; `tests/fixtures/stream_json/` pins sanitized real captures, and
+`claude-pool doctor` checks your installed CLI end to end.
 
 ## Process lifecycle
 
