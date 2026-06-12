@@ -24,6 +24,15 @@ claude-pool serve \
   --max-workers 4
 ```
 
+Use the TUI backend when you need to avoid Claude Code print mode:
+
+```sh
+claude-pool serve \
+  --backend tui \
+  --socket /tmp/claude-pool-tui.sock \
+  --warm 1
+```
+
 The default socket is `$XDG_RUNTIME_DIR/claude-pool.sock` when
 `XDG_RUNTIME_DIR` is set, otherwise `/tmp/claude-pool-$(id -u).sock`.
 

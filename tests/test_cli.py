@@ -14,6 +14,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKE = ROOT / "tests" / "fake_claude.py"
+TUI_FAKE = ROOT / "tests" / "fake_claude_tui.py"
 
 
 def cli_args(*args: str) -> list[str]:
@@ -299,6 +300,29 @@ def test_status_reports_warm_pid_and_profile(tmp_path: Path) -> None:
         wait_for_no_fake_processes()
 
 
+def test_status_reports_tui_backend(tmp_path: Path) -> None:
+    process, socket_path = start_server(
+        tmp_path,
+        "--warm",
+        "0",
+        "--backend",
+        "tui",
+        "--claude-bin",
+        sys.executable,
+        "--extra-arg",
+        str(TUI_FAKE),
+    )
+    try:
+        completed = run_cli(["status", "--socket", str(socket_path)])
+        status = parse_status(completed.stdout)
+
+        assert completed.returncode == 0
+        assert status["backend"] == "tui"
+    finally:
+        stop_server(process)
+        wait_for_no_fake_processes()
+
+
 def test_socket_file_mode_is_0600(tmp_path: Path) -> None:
     process, socket_path = start_server(tmp_path, "--warm", "0")
     try:
@@ -430,6 +454,13 @@ def test_doctor_against_fake_reports_latency_and_session_id() -> None:
     assert completed.returncode == 0
     assert "round_trip_ms:" in completed.stdout
     assert "session_id: fake-" in completed.stdout
+
+
+def test_doctor_help_mentions_backend() -> None:
+    completed = run_cli(["doctor", "--help"], timeout=10.0)
+
+    assert completed.returncode == 0
+    assert "--backend" in completed.stdout
 
 
 def test_ask_without_server_fails_helpfully(tmp_path: Path) -> None:
