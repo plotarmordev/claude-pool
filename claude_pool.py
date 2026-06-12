@@ -586,10 +586,13 @@ class ClaudePool:
 
     async def _replenisher(self) -> None:
         while True:
+            waiter = asyncio.create_task(self._replenish_event.wait())
             try:
-                await asyncio.wait_for(self._replenish_event.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
-                pass
+                await asyncio.wait({waiter}, timeout=1.0)
+            finally:
+                waiter.cancel()
+                with suppress(asyncio.CancelledError):
+                    await waiter
             self._replenish_event.clear()
             self._discard_dead_warm()
             await self._replenish_once()
