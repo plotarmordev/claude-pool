@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import argparse
 import asyncio
 import concurrent.futures
 from collections import deque
@@ -12,7 +13,11 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+import shutil
 import signal
+import socket
+import stat
+import subprocess
 import sys
 import threading
 import time
@@ -952,10 +957,410 @@ class ClaudePool:
         return None
 
 
+def _default_socket_path() -> str:
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        return os.path.join(runtime_dir, "claude-pool.sock")
+    return f"/tmp/claude-pool-{os.getuid()}.sock"
+
+
+def _split_csv(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    return [part for part in value.split(",") if part]
+
+
+def _json_line(payload: Mapping[str, Any]) -> bytes:
+    return json.dumps(payload, separators=(",", ":")).encode() + b"\n"
+
+
+def _result_response(result: Result) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "text": result.text,
+        "is_error": result.is_error,
+        "subtype": result.subtype,
+        "session_id": result.session_id,
+        "usage": dict(result.usage),
+        "cost_usd": result.cost_usd,
+    }
+
+
+def _error_response(kind: str, error: str) -> dict[str, Any]:
+    return {"ok": False, "kind": kind, "error": error}
+
+
+def _pool_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "model": args.model,
+        "effort": args.effort,
+        "system_prompt": args.system_prompt,
+        "allowed_tools": _split_csv(args.allowed_tools),
+        "disallowed_tools": _split_csv(args.disallowed_tools),
+        "permission_mode": args.permission_mode,
+        "cwd": args.cwd,
+        "claude_bin": args.claude_bin,
+        "extra_args": args.extra_arg or [],
+        "warm": args.warm,
+        "max_workers": args.max_workers,
+        "max_idle": args.max_idle,
+        "default_timeout": args.default_timeout,
+    }
+
+
+def _profile_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "model": args.model,
+        "effort": args.effort,
+        "warm": args.warm,
+        "max_workers": args.max_workers,
+        "claude_bin": args.claude_bin,
+    }
+
+
+def _request_timeout(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("timeout must be a number")
+    timeout = float(value)
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    return timeout
+
+
+def _prepare_socket_path(socket_path: str) -> bool:
+    try:
+        mode = os.stat(socket_path).st_mode
+    except FileNotFoundError:
+        return True
+
+    if not stat.S_ISSOCK(mode):
+        print(
+            f"claude-pool serve: cannot bind {socket_path}: path is not a socket", file=sys.stderr
+        )
+        return False
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1.0)
+        try:
+            probe.connect(socket_path)
+        except OSError:
+            os.unlink(socket_path)
+            return True
+
+    print(
+        f"another claude-pool daemon is already serving on {socket_path}",
+        file=sys.stderr,
+    )
+    return False
+
+
+async def _write_response(
+    writer: asyncio.StreamWriter,
+    response: Mapping[str, Any],
+) -> None:
+    writer.write(_json_line(response))
+    await writer.drain()
+
+
+async def _run_serve(args: argparse.Namespace) -> int:
+    socket_path = args.socket or _default_socket_path()
+    pool = ClaudePool(**_pool_kwargs_from_args(args))
+    profile = _profile_from_args(args)
+    in_flight = 0
+    connections: set[asyncio.Task[Any]] = set()
+
+    async def handle_request(line: bytes) -> dict[str, Any]:
+        nonlocal in_flight
+        try:
+            request = json.loads(line.decode(errors="replace"))
+        except json.JSONDecodeError as exc:
+            return _error_response("BadRequest", f"malformed JSON: {exc.msg}")
+        if not isinstance(request, dict):
+            return _error_response("BadRequest", "request must be a JSON object")
+
+        op = request.get("op")
+        if "op" in request and not isinstance(op, str):
+            return _error_response("BadRequest", "op must be a string")
+        if op == "ask":
+            prompt = request.get("prompt")
+            if not isinstance(prompt, str):
+                return _error_response("BadRequest", "ask requires string prompt")
+            try:
+                timeout = _request_timeout(request.get("timeout"))
+            except ValueError as exc:
+                return _error_response("BadRequest", str(exc))
+            in_flight += 1
+            try:
+                result = await pool.ask(prompt, timeout=timeout)
+            except ClaudePoolError as exc:
+                return _error_response(type(exc).__name__, str(exc))
+            finally:
+                in_flight -= 1
+            return _result_response(result)
+
+        if op == "status":
+            return {
+                "ok": True,
+                "warm": len(pool._warm),
+                "in_flight": in_flight,
+                "profile": profile,
+                "pid": os.getpid(),
+            }
+
+        if isinstance(op, str):
+            return _error_response("BadRequest", f"unknown op: {op}")
+        return _error_response("BadRequest", "missing op")
+
+    async def handle_client(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            connections.add(task)
+        try:
+            while True:
+                try:
+                    line = await reader.readline()
+                except (ValueError, asyncio.LimitOverrunError):
+                    await _write_response(
+                        writer,
+                        _error_response("BadRequest", "request line is too large"),
+                    )
+                    break
+                if line == b"":
+                    break
+                response = await handle_request(line)
+                await _write_response(writer, response)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug("client disconnected during response")
+        except Exception as exc:
+            logger.exception("client handler failed")
+            with suppress(Exception):
+                await _write_response(writer, _error_response(type(exc).__name__, str(exc)))
+        finally:
+            if task is not None:
+                connections.discard(task)
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
+
+    try:
+        if not _prepare_socket_path(socket_path):
+            return 1
+    except OSError as exc:
+        print(f"claude-pool serve: cannot bind {socket_path}: {exc.strerror}", file=sys.stderr)
+        return 1
+
+    shutdown = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with suppress(NotImplementedError):
+            loop.add_signal_handler(sig, shutdown.set)
+
+    old_umask = os.umask(0o177)
+    try:
+        server = await asyncio.start_unix_server(
+            handle_client,
+            path=socket_path,
+            limit=_STDOUT_LIMIT,
+        )
+    except OSError as exc:
+        print(f"claude-pool serve: cannot bind {socket_path}: {exc.strerror}", file=sys.stderr)
+        return 1
+    finally:
+        os.umask(old_umask)
+    os.chmod(socket_path, 0o600)
+    try:
+        await pool.start()
+        await shutdown.wait()
+    finally:
+        server.close()
+        tasks = tuple(connections)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await server.wait_closed()
+        await pool.aclose()
+        with suppress(FileNotFoundError):
+            os.unlink(socket_path)
+    return 0
+
+
+def _send_client_request(socket_path: str, request: Mapping[str, Any]) -> dict[str, Any]:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(socket_path)
+        with client.makefile("rwb") as file:
+            file.write(_json_line(request))
+            file.flush()
+            line = file.readline()
+    if not line:
+        raise RuntimeError("server closed the connection without a response")
+    response = json.loads(line.decode(errors="replace"))
+    if not isinstance(response, dict):
+        raise RuntimeError("server returned a non-object response")
+    return response
+
+
+def _run_client_ask(args: argparse.Namespace) -> int:
+    socket_path = args.socket or _default_socket_path()
+    request: dict[str, Any] = {"op": "ask", "prompt": args.prompt}
+    if args.timeout is not None:
+        request["timeout"] = args.timeout
+    try:
+        response = _send_client_request(socket_path, request)
+    except (OSError, json.JSONDecodeError, RuntimeError) as exc:
+        print(f"failed to contact claude-pool server: {exc}", file=sys.stderr)
+        return 1
+
+    if not response.get("ok"):
+        print(f"{response.get('kind', 'Error')}: {response.get('error', '')}", file=sys.stderr)
+        return 1
+
+    text = response.get("text", "")
+    print(text if isinstance(text, str) else "")
+    return 1 if response.get("is_error") else 0
+
+
+def _run_client_status(args: argparse.Namespace) -> int:
+    socket_path = args.socket or _default_socket_path()
+    try:
+        response = _send_client_request(socket_path, {"op": "status"})
+    except (OSError, json.JSONDecodeError, RuntimeError) as exc:
+        print(f"failed to contact claude-pool server: {exc}", file=sys.stderr)
+        return 1
+
+    if not response.get("ok"):
+        print(f"{response.get('kind', 'Error')}: {response.get('error', '')}", file=sys.stderr)
+        return 1
+
+    print(f"warm: {response.get('warm')}")
+    print(f"in_flight: {response.get('in_flight')}")
+    print(f"pid: {response.get('pid')}")
+    profile = response.get("profile")
+    if isinstance(profile, Mapping):
+        for key in sorted(profile):
+            print(f"profile.{key}: {profile[key]}")
+    return 0
+
+
+def _run_doctor(args: argparse.Namespace) -> int:
+    binary = shutil.which(args.claude_bin)
+    if binary is None:
+        print(f"Claude binary not found: {args.claude_bin}", file=sys.stderr)
+        print("Diagnosis: install Claude Code or pass --claude-bin PATH.", file=sys.stderr)
+        return 1
+
+    try:
+        version = subprocess.run(
+            [binary, "--version"],
+            input="",
+            text=True,
+            capture_output=True,
+            timeout=30.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Could not run {binary} --version: {exc}", file=sys.stderr)
+        return 1
+    if version.returncode != 0:
+        detail = (version.stderr or version.stdout).strip()
+        print(f"{binary} --version failed with exit {version.returncode}", file=sys.stderr)
+        if detail:
+            print(detail, file=sys.stderr)
+        return 1
+
+    version_text = (version.stdout or version.stderr).strip() or "(no version output)"
+    print(f"version: {version_text}")
+
+    pool = ClaudePool(warm=0, max_workers=1, claude_bin=binary)
+    started = time.monotonic()
+    try:
+        result = pool.ask_sync("Reply with exactly: OK", timeout=args.timeout)
+    except AskTimeout:
+        print(f"AskTimeout: doctor prompt exceeded {args.timeout} seconds", file=sys.stderr)
+        return 1
+    except (WorkerStartError, WorkerCrashError) as exc:
+        tail = exc.stderr_tail.strip()
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        if tail:
+            print(tail, file=sys.stderr)
+        lowered = tail.lower()
+        if "invalid api key" in lowered or "login" in lowered:
+            print("Diagnosis: Claude authentication failed; run /login.", file=sys.stderr)
+        else:
+            print("Diagnosis: Claude worker could not complete a test turn.", file=sys.stderr)
+        return 1
+    except ClaudePoolError as exc:
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        pool.close()
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    print(f"round_trip_ms: {elapsed_ms}")
+    print(f"session_id: {result.session_id}")
+    return 0
+
+
+def _add_profile_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model")
+    parser.add_argument("--effort")
+    parser.add_argument("--system-prompt")
+    parser.add_argument("--allowed-tools")
+    parser.add_argument("--disallowed-tools")
+    parser.add_argument("--permission-mode")
+    parser.add_argument("--cwd")
+    parser.add_argument("--claude-bin", default="claude")
+    parser.add_argument("--extra-arg", action="append")
+    parser.add_argument("--warm", type=int, default=1)
+    parser.add_argument("--max-workers", type=int, default=4)
+    parser.add_argument("--max-idle", type=float, default=900.0)
+    parser.add_argument("--default-timeout", type=float, default=600.0)
+    parser.add_argument("--socket")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="claude-pool")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    serve = subparsers.add_parser("serve", help="run a Unix-socket claude-pool daemon")
+    _add_profile_arguments(serve)
+
+    ask = subparsers.add_parser("ask", help="send one prompt to a claude-pool daemon")
+    ask.add_argument("prompt")
+    ask.add_argument("--socket")
+    ask.add_argument("--timeout", type=float)
+
+    status = subparsers.add_parser("status", help="show daemon status")
+    status.add_argument("--socket")
+
+    doctor = subparsers.add_parser(
+        "doctor",
+        help="check Claude Code and make one real API call",
+        description="Check Claude Code and make one real API call.",
+    )
+    doctor.add_argument("--claude-bin", default="claude")
+    doctor.add_argument("--timeout", type=float, default=60.0)
+    return parser
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the claude-pool command-line interface and return a process status."""
-    del argv
-    sys.stderr.write("not yet implemented\n")
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "serve":
+        return asyncio.run(_run_serve(args))
+    if args.command == "ask":
+        return _run_client_ask(args)
+    if args.command == "status":
+        return _run_client_status(args)
+    if args.command == "doctor":
+        return _run_doctor(args)
+    parser.error("unknown command")
     return 2
 
 
