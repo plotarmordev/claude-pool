@@ -5,13 +5,21 @@ from contextlib import suppress
 import os
 import shlex
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from claude_pool import AskTimeout, Result, WorkerCrashError, WorkerStartError, _TuiWorker
+from claude_pool import (
+    AskTimeout,
+    Result,
+    WorkerCrashError,
+    WorkerStartError,
+    _LIVE_PGIDS,
+    _TuiWorker,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +54,20 @@ async def assert_process_group_gone(pgid: int) -> None:
             return
         await asyncio.sleep(0.05)
     raise AssertionError(f"process group {pgid} still exists")
+
+
+async def assert_no_tui_reader_threads() -> None:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        threads = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name == "claude-pool-tui-pty-reader"
+        ]
+        if not threads:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("TUI pty reader threads remain")
 
 
 def shell_wrapped_fake() -> list[str]:
@@ -102,6 +124,19 @@ def test_tui_worker_accepts_trust_dialog() -> None:
     run(scenario())
 
 
+def test_tui_worker_waits_for_session_start_hook_before_ask() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake(env={"FAKE_TUI_SLOW_START": "2"})
+        try:
+            result_message, _rate_limit = await worker.ask("after-start", timeout=5.0)
+
+            assert result_message["result"] == "after-start"
+        finally:
+            await worker.retire()
+
+    run(scenario())
+
+
 def test_tui_worker_startup_exit_raises_worker_start_error() -> None:
     async def scenario() -> None:
         with pytest.raises(WorkerStartError) as raised:
@@ -130,6 +165,22 @@ def test_tui_worker_timeout_kills_process_group() -> None:
         with pytest.raises(AskTimeout):
             await worker.ask("SLEEP:30", timeout=1.0)
 
+        assert worker.alive is False
+        await assert_process_group_gone(pgid)
+
+    run(scenario())
+
+
+def test_tui_worker_large_prompt_timeout_does_not_block_event_loop() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake(env={"FAKE_TUI_STALL": "1"})
+        pgid = os.getpgid(worker.process.pid)
+        started = time.monotonic()
+
+        with pytest.raises(AskTimeout):
+            await worker.ask("x" * 200_000, timeout=2.0)
+
+        assert time.monotonic() - started < 3.5
         assert worker.alive is False
         await assert_process_group_gone(pgid)
 
@@ -171,12 +222,31 @@ def test_tui_worker_retire_removes_tempdir_and_process_group() -> None:
         pgid = os.getpgid(worker.process.pid)
 
         result_message, _rate_limit = await worker.ask("hello", timeout=5.0)
+        started = time.monotonic()
         await worker.retire()
 
         assert result_message["type"] == "result"
+        assert time.monotonic() - started < 1.5
         assert not tempdir.exists()
         assert worker.alive is False
         await assert_process_group_gone(pgid)
+        await assert_no_tui_reader_threads()
+
+    run(scenario())
+
+
+def test_tui_worker_retire_signals_straggler_child_after_clean_leader_exit() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake()
+        pgid = os.getpgid(worker.process.pid)
+
+        result_message, _rate_limit = await worker.ask("EXIT_WITH_CHILD", timeout=5.0)
+        await worker.retire()
+
+        assert result_message["result"] == "EXIT_WITH_CHILD"
+        assert pgid not in _LIVE_PGIDS
+        await assert_process_group_gone(pgid)
+        await assert_no_tui_reader_threads()
 
     run(scenario())
 
@@ -222,6 +292,19 @@ def test_tui_worker_waits_for_complete_hook_line() -> None:
 
             assert result_message["result"] == "partial"
             assert time.monotonic() - started >= 0.25
+        finally:
+            await worker.retire()
+
+    run(scenario())
+
+
+def test_tui_worker_skips_junk_hook_lines() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake(env={"FAKE_TUI_JUNK_HOOK": "1"})
+        try:
+            result_message, _rate_limit = await worker.ask("after-junk", timeout=5.0)
+
+            assert result_message["result"] == "after-junk"
         finally:
             await worker.retire()
 

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shlex
 import sys
 import time
 
@@ -58,16 +59,18 @@ def read_until_submit() -> None:
             return
 
 
-def hook_command(settings_path: str) -> str:
+def hook_command(settings_path: str, event: str) -> str:
     settings = json.loads(Path(settings_path).read_text())
-    stop_hooks = settings["hooks"]["Stop"]
-    return stop_hooks[0]["hooks"][0]["command"]
+    hooks = settings["hooks"][event]
+    return hooks[0]["hooks"][0]["command"]
 
 
 def hook_target(command: str) -> Path:
     if ">>" not in command:
         raise RuntimeError(f"unsupported hook command: {command}")
-    return Path(command.split(">>", 1)[1].strip())
+    tail = command.split(">>", 1)[1].strip()
+    parts = shlex.split(tail)
+    return Path(parts[0])
 
 
 def write_transcript(path: Path, text: str) -> None:
@@ -89,7 +92,7 @@ def write_transcript(path: Path, text: str) -> None:
 
 
 def emit_hook(args: argparse.Namespace, text: str) -> None:
-    command = hook_command(args.settings)
+    command = hook_command(args.settings, "Stop")
     target = hook_target(command)
     transcript_path = target.parent / "fake-transcript.jsonl"
     write_transcript(transcript_path, text)
@@ -102,8 +105,12 @@ def emit_hook(args: argparse.Namespace, text: str) -> None:
         "effort": args.effort,
     }
     line = json.dumps(payload, separators=(",", ":")) + "\n"
+    if os.environ.get("FAKE_TUI_JUNK_HOOK") == "1":
+        with target.open("a", encoding="utf-8") as file:
+            file.write("[1,2,3]\n\n")
     if os.environ.get("FAKE_TUI_PARTIAL_HOOK") == "1":
-        target.write_text(line.rstrip("\n"))
+        with target.open("a", encoding="utf-8") as file:
+            file.write(line.rstrip("\n"))
         time.sleep(0.3)
         with target.open("a", encoding="utf-8") as file:
             file.write("\n")
@@ -111,11 +118,30 @@ def emit_hook(args: argparse.Namespace, text: str) -> None:
     subprocess.run(command, input=line, text=True, shell=True, check=False)
 
 
+def emit_session_start(args: argparse.Namespace) -> None:
+    command = hook_command(args.settings, "SessionStart")
+    payload = {
+        "session_id": args.session_id,
+        "hook_event_name": "SessionStart",
+    }
+    subprocess.run(
+        command,
+        input=json.dumps(payload, separators=(",", ":")) + "\n",
+        text=True,
+        shell=True,
+        check=False,
+    )
+
+
 def handle_prompt(args: argparse.Namespace, prompt: str) -> None:
     if prompt.startswith("SLEEP:"):
         time.sleep(float(prompt.removeprefix("SLEEP:")))
         emit_hook(args, prompt)
         return
+    if prompt.startswith("EXIT_WITH_CHILD"):
+        subprocess.Popen(["sleep", "30"])
+        emit_hook(args, prompt)
+        raise SystemExit(0)
     if prompt.startswith("DIE"):
         write_screen("fake-tui dying")
         raise SystemExit(3)
@@ -178,7 +204,14 @@ def main() -> int:
     if os.environ.get("FAKE_TUI_TRUST") == "1":
         write_screen("Do you trust the files in this folder?")
         read_until_submit()
+    slow_start = os.environ.get("FAKE_TUI_SLOW_START")
+    if slow_start:
+        time.sleep(float(slow_start))
+    emit_session_start(args)
     write_screen("fake-tui ready")
+    if os.environ.get("FAKE_TUI_STALL") == "1":
+        while True:
+            time.sleep(60.0)
     consume_input(args)
     return 0
 

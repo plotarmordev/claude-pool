@@ -16,15 +16,24 @@ The worker starts:
 claude --session-id <uuid> --settings <settings.json> [profile flags]
 ```
 
-The generated settings file registers a `Stop` hook:
+The generated settings file registers `SessionStart` and `Stop` hooks:
 
 ```json
-{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cat >> <hook.ndjson>"}]}]}}
+{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"cat >> <ready.marker>"}]}],"Stop":[{"hooks":[{"type":"command","command":"cat >> <hook.ndjson>"}]}]}}
 ```
 
 The process owns its own POSIX process group and runs on a pty. The pty output
 is drained only for diagnostics. Turn completion is detected from the Stop-hook
 file, not by screen scraping.
+
+When no cwd is provided, the worker starts in `~/.cache/claude-pool/cwd`.
+Claude Code persists workspace trust by path, so this stable scratch directory
+avoids paying a trust prompt for every worker. A caller-provided cwd still wins.
+
+Readiness is detected by the `SessionStart` hook writing to the marker file.
+The worker keeps answering a visible trust prompt with carriage return while it
+waits for that hook; it does not infer readiness from pty silence or screen
+text.
 
 ## Turn completion
 
