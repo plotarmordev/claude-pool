@@ -3,11 +3,12 @@
 `claude-pool` is a zero-dependency Python utility for running the Claude Code
 CLI through warm persistent workers.
 
-It keeps Claude Code worker processes ready, sends prompts over the observed
-stream-json protocol, and returns structured result objects. A plain `ask()`
-uses a fresh worker context for each request. Multi-turn conversations are only
-kept when you explicitly open a `Session`. The optional Unix-socket daemon
-speaks NDJSON so programs in any language can send prompt requests.
+It keeps Claude Code worker processes ready, sends prompts through either the
+default stream-json print-mode backend or the TUI pty backend, and returns
+structured result objects. A plain `ask()` uses a fresh worker context for each
+request. Multi-turn conversations are only kept when you explicitly open a
+`Session`. The optional Unix-socket daemon speaks NDJSON so programs in any
+language can send prompt requests.
 
 `claude-pool` is not affiliated with Anthropic.
 
@@ -103,8 +104,20 @@ Check the local Claude Code setup. This makes one real Claude request:
 claude-pool doctor
 ```
 
+Use `claude-pool doctor --backend both` to check both backends. That makes two
+real Claude requests.
+
 See [examples/shell.md](examples/shell.md) for a two-daemon multi-profile
 pattern and a `systemd --user` unit sketch.
+
+## Backends
+
+Choose a backend with `ClaudePool(backend=...)` or `claude-pool serve --backend`.
+
+| Backend | Use when | Tradeoff |
+| --- | --- | --- |
+| `stream-json` | You want structured metadata including usage, cost, duration, and rate-limit events. | Uses Claude Code print mode (`claude -p`). This is the default. |
+| `tui` | You need to avoid print mode and drive plain `claude` in a pty. | Text-first result metadata, best-effort usage extraction, and heavier worker startup. |
 
 ## How It Works
 
@@ -131,7 +144,7 @@ turns.
 
 ## How this relates to `claude -p`
 
-The current stream-json backend is Claude Code print mode kept warm:
+The default `stream-json` backend is Claude Code print mode kept warm:
 
 ```text
 claude -p --input-format stream-json --output-format stream-json --verbose
@@ -143,7 +156,9 @@ lifecycle: `claude-pool` starts workers ahead of time and reuses a checked-out
 process for exactly one plain `ask()` or for the lifetime of an explicit
 `Session`.
 
-A TUI backend that does not use print mode is planned for v0.2.
+The `tui` backend is the shipped no-`-p` path. It starts plain `claude` in a
+pty, registers Claude Code hooks, and reads completed turn text from the Stop
+hook payload.
 
 ## Result Fields
 

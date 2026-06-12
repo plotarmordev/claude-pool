@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-06-13
+
+### Added
+
+- TUI backend that drives plain `claude` in a pty through Stop-hook turn results, without `-p`.
+- Backend selection with `ClaudePool(backend=...)`, `claude-pool serve --backend`, and daemon status reporting.
+- `claude-pool doctor --backend stream-json|tui|both` coverage.
+- Cross-backend parity tests for shared pool, session, timeout, and cleanup contracts.
+
+### Fixed
+
+- v0.1.x daemon metadata, client timeout, protocol fixture, and TUI worker hygiene issues.
+
 ## [0.1.0] - 2026-06-12
 
 ### Added

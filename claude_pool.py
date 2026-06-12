@@ -1,4 +1,4 @@
-"""Warm persistent workers for running the Claude Code CLI through stream-json I/O."""
+"""Warm persistent workers for running the Claude Code CLI."""
 
 from __future__ import annotations
 
@@ -347,17 +347,15 @@ class PoolClosed(ClaudePoolError):
 def _build_tui_argv(
     command: Sequence[str],
     *,
-    session_id: str,
-    settings_path: str,
     model: str | None = None,
     effort: str | None = None,
     system_prompt: str | None = None,
     allowed_tools: Sequence[str] | None = None,
     disallowed_tools: Sequence[str] | None = None,
+    permission_mode: str | None = None,
     extra_args: Sequence[str] | None = None,
 ) -> list[str]:
     argv = list(command)
-    argv.extend(["--session-id", session_id, "--settings", settings_path])
     if model is not None:
         argv.extend(["--model", model])
     if effort is not None:
@@ -368,6 +366,8 @@ def _build_tui_argv(
         argv.extend(["--allowedTools", ",".join(allowed_tools)])
     if disallowed_tools is not None:
         argv.extend(["--disallowedTools", ",".join(disallowed_tools)])
+    if permission_mode is not None:
+        argv.extend(["--permission-mode", permission_mode])
     if extra_args is not None:
         argv.extend(extra_args)
     return argv
@@ -472,7 +472,11 @@ class _TuiWorker:
                 full_env.update(env)
             worker_cwd = cwd if cwd is not None else _default_tui_cwd()
             process = await asyncio.create_subprocess_exec(
-                *_build_tui_argv(argv, session_id=session_id, settings_path=settings_path),
+                *argv,
+                "--session-id",
+                session_id,
+                "--settings",
+                settings_path,
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
@@ -824,7 +828,7 @@ class Session:
     def __init__(self, pool: ClaudePool) -> None:
         """Create an unentered session bound to ``pool``."""
         self._pool = pool
-        self._worker: _Worker | None = None
+        self._worker: _Worker | _TuiWorker | None = None
         self._send_lock = asyncio.Lock()
         self._entered = False
         self._exited = False
@@ -968,10 +972,31 @@ class ClaudePool:
         max_workers: int = 4,
         max_idle: float = 900.0,
         default_timeout: float = 600.0,
+        backend: str = "stream-json",
     ) -> None:
-        """Create a pool configuration without starting workers."""
+        """Create a pool configuration without starting workers.
+
+        ``backend`` selects the worker transport: ``"stream-json"`` for Claude
+        Code print mode, or ``"tui"`` for plain Claude Code in a pty.
+        """
+        if backend not in {"stream-json", "tui"}:
+            raise ClaudePoolError(f"unknown backend: {backend}")
+        if backend == "tui" and (os.name != "posix" or pty is None):
+            raise ClaudePoolError("tui backend requires POSIX ptys")
+
+        self._backend = backend
         self._argv = self._build_argv(
             claude_bin=claude_bin,
+            model=model,
+            effort=effort,
+            system_prompt=system_prompt,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+            permission_mode=permission_mode,
+            extra_args=extra_args,
+        )
+        self._tui_argv = _build_tui_argv(
+            [claude_bin],
             model=model,
             effort=effort,
             system_prompt=system_prompt,
@@ -988,7 +1013,7 @@ class ClaudePool:
         self._max_workers = max(1, max_workers)
         self._max_idle = max_idle
         self._default_timeout = default_timeout
-        self._warm: deque[_Worker] = deque()
+        self._warm: deque[_Worker | _TuiWorker] = deque()
         self._semaphore = asyncio.Semaphore(self._max_workers)
         self._closed = False
         self._started = False
@@ -1318,7 +1343,7 @@ class ClaudePool:
                 self._reap(worker)
                 self._nudge_replenisher()
 
-    async def _checkout_worker(self) -> tuple[_Worker, bool]:
+    async def _checkout_worker(self) -> tuple[_Worker | _TuiWorker, bool]:
         while self._warm:
             worker = self._warm.pop()
             if not worker.alive:
@@ -1330,8 +1355,10 @@ class ClaudePool:
             return worker, True
         return await self._spawn_worker(), False
 
-    async def _spawn_worker(self) -> _Worker:
+    async def _spawn_worker(self) -> _Worker | _TuiWorker:
         try:
+            if self._backend == "tui":
+                return await _TuiWorker.spawn(self._tui_argv, cwd=self._cwd, env=self._env)
             return await _Worker.spawn(self._argv, cwd=self._cwd, env=self._env)
         except OSError as exc:
             raise WorkerStartError(str(exc)) from exc
@@ -1356,7 +1383,7 @@ class ClaudePool:
                 if cooldown_remaining > 0:
                     return
                 self._spawns_in_flight += 1
-                worker: _Worker | None = None
+                worker: _Worker | _TuiWorker | None = None
                 try:
                     worker = await self._spawn_worker()
                     await asyncio.sleep(0.5)
@@ -1394,7 +1421,7 @@ class ClaudePool:
             await self._retire_expired_warm()
 
     async def _retire_expired_warm(self) -> None:
-        kept: deque[_Worker] = deque()
+        kept: deque[_Worker | _TuiWorker] = deque()
         now = time.monotonic()
         while self._warm:
             worker = self._warm.popleft()
@@ -1407,7 +1434,7 @@ class ClaudePool:
         self._warm = kept
 
     def _discard_dead_warm(self) -> None:
-        kept: deque[_Worker] = deque()
+        kept: deque[_Worker | _TuiWorker] = deque()
         while self._warm:
             worker = self._warm.popleft()
             if worker.alive:
@@ -1416,7 +1443,7 @@ class ClaudePool:
                 self._reap(worker, kill=True)
         self._warm = kept
 
-    def _reap(self, worker: _Worker, *, kill: bool = False) -> None:
+    def _reap(self, worker: _Worker | _TuiWorker, *, kill: bool = False) -> None:
         task = asyncio.create_task(worker.kill() if kill else worker.retire())
         self._reaper_tasks.add(task)
         task.add_done_callback(self._reaper_tasks.discard)
@@ -1489,6 +1516,7 @@ def _pool_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "max_workers": args.max_workers,
         "max_idle": args.max_idle,
         "default_timeout": args.default_timeout,
+        "backend": args.backend,
     }
 
 
@@ -1589,7 +1617,7 @@ async def _run_serve(args: argparse.Namespace) -> int:
                 "ok": True,
                 "warm": len(pool._warm),
                 "in_flight": in_flight,
-                "backend": "stream-json",
+                "backend": pool._backend,
                 "profile": profile,
                 "pid": os.getpid(),
             }
@@ -1744,6 +1772,50 @@ def _run_client_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _doctor_backends(value: str) -> list[str]:
+    if value == "both":
+        return ["stream-json", "tui"]
+    return [value]
+
+
+def _run_doctor_backend(binary: str, *, backend: str, timeout: float) -> bool:
+    pool: ClaudePool | None = None
+    started = time.monotonic()
+    try:
+        pool = ClaudePool(warm=0, max_workers=1, claude_bin=binary, backend=backend)
+        result = pool.ask_sync("Reply with exactly: OK", timeout=timeout)
+    except AskTimeout:
+        print(f"[{backend}] AskTimeout: doctor prompt exceeded {timeout} seconds", file=sys.stderr)
+        return False
+    except (WorkerStartError, WorkerCrashError) as exc:
+        tail = exc.stderr_tail.strip()
+        print(f"[{backend}] {type(exc).__name__}: {exc}", file=sys.stderr)
+        if tail:
+            print(tail, file=sys.stderr)
+        lowered = tail.lower()
+        if "invalid api key" in lowered or "login" in lowered:
+            print(
+                f"[{backend}] Diagnosis: Claude authentication failed; run /login.", file=sys.stderr
+            )
+        else:
+            print(
+                f"[{backend}] Diagnosis: Claude worker could not complete a test turn.",
+                file=sys.stderr,
+            )
+        return False
+    except ClaudePoolError as exc:
+        print(f"[{backend}] {type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
+    finally:
+        if pool is not None:
+            pool.close()
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    print(f"[{backend}] round_trip_ms: {elapsed_ms}")
+    print(f"[{backend}] session_id: {result.session_id}")
+    return True
+
+
 def _run_doctor(args: argparse.Namespace) -> int:
     binary = shutil.which(args.claude_bin)
     if binary is None:
@@ -1773,37 +1845,14 @@ def _run_doctor(args: argparse.Namespace) -> int:
     version_text = (version.stdout or version.stderr).strip() or "(no version output)"
     print(f"version: {version_text}")
 
-    pool = ClaudePool(warm=0, max_workers=1, claude_bin=binary)
-    started = time.monotonic()
-    try:
-        result = pool.ask_sync("Reply with exactly: OK", timeout=args.timeout)
-    except AskTimeout:
-        print(f"AskTimeout: doctor prompt exceeded {args.timeout} seconds", file=sys.stderr)
-        return 1
-    except (WorkerStartError, WorkerCrashError) as exc:
-        tail = exc.stderr_tail.strip()
-        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
-        if tail:
-            print(tail, file=sys.stderr)
-        lowered = tail.lower()
-        if "invalid api key" in lowered or "login" in lowered:
-            print("Diagnosis: Claude authentication failed; run /login.", file=sys.stderr)
-        else:
-            print("Diagnosis: Claude worker could not complete a test turn.", file=sys.stderr)
-        return 1
-    except ClaudePoolError as exc:
-        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        pool.close()
-
-    elapsed_ms = int((time.monotonic() - started) * 1000)
-    print(f"round_trip_ms: {elapsed_ms}")
-    print(f"session_id: {result.session_id}")
-    return 0
+    ok = True
+    for backend in _doctor_backends(args.backend):
+        ok = _run_doctor_backend(binary, backend=backend, timeout=args.timeout) and ok
+    return 0 if ok else 1
 
 
 def _add_profile_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--backend", choices=("stream-json", "tui"), default="stream-json")
     parser.add_argument("--model")
     parser.add_argument("--effort")
     parser.add_argument("--system-prompt")
@@ -1837,11 +1886,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser(
         "doctor",
-        help="check Claude Code and make one real API call",
-        description="Check Claude Code and make one real API call.",
+        help="check Claude Code and make one real API call per selected backend",
+        description=(
+            "Check Claude Code and make one real API call per selected backend; "
+            "--backend both makes two real API calls."
+        ),
     )
     doctor.add_argument("--claude-bin", default="claude")
     doctor.add_argument("--timeout", type=float, default=60.0)
+    doctor.add_argument("--backend", choices=("stream-json", "tui", "both"), default="stream-json")
     return parser
 
 

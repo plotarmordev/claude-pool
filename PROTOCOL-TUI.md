@@ -1,9 +1,8 @@
 # The Claude Code TUI Stop-hook worker protocol (observed)
 
-`claude-pool` v0.2 will add a TUI backend that drives plain `claude` in a pty,
-without `-p` and without stream-json. Task 62 adds the private worker only; the
-public pool still uses the stream-json backend until Task 63 wires backend
-selection.
+`claude-pool` v0.2 includes a TUI backend that drives plain `claude` in a pty,
+without `-p` and without stream-json. Select it with
+`ClaudePool(backend="tui")` or `claude-pool serve --backend tui`.
 
 Everything below was observed live against **Claude Code 2.1.175** (Linux/arm64,
 Raspberry Pi 5) on 2026-06-12 and is covered by `tests/fake_claude_tui.py`.
