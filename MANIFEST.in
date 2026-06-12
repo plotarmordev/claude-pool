@@ -1,0 +1,4 @@
+include CHANGELOG.md
+include PROTOCOL.md
+include tests/fake_claude.py
+recursive-include examples *.md *.py
