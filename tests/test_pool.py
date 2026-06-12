@@ -9,7 +9,8 @@ from typing import Any
 
 import pytest
 
-from claude_pool import ClaudePool, PoolClosed, WorkerCrashError
+from claude_pool import ClaudePool, ClaudePoolError, PoolClosed, WorkerCrashError, WorkerStartError
+from claude_pool import _LIVE_PGIDS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +85,30 @@ def write_warm_crash_wrapper(tmp_path: Path) -> Path:
     return wrapper
 
 
+def write_startup_fail_once_wrapper(tmp_path: Path) -> Path:
+    marker = tmp_path / "startup-used"
+    wrapper = tmp_path / "claude-startup-wrapper.py"
+    wrapper.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import os",
+                "from pathlib import Path",
+                "import sys",
+                f"marker = Path({str(marker)!r})",
+                f"fake = {str(FAKE)!r}",
+                "if not marker.exists():",
+                "    marker.write_text('used')",
+                "    raise SystemExit(2)",
+                "os.execv(sys.executable, [sys.executable, fake, *sys.argv[1:]])",
+            ]
+        )
+        + "\n"
+    )
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+    return wrapper
+
+
 def test_warm_hit_consumes_worker_and_replenishes() -> None:
     async def scenario() -> None:
         pool = ClaudePool(**pool_kwargs(warm=1))
@@ -104,6 +129,28 @@ def test_warm_hit_consumes_worker_and_replenishes() -> None:
     run(scenario())
 
 
+def test_warm_pool_sequential_asks_do_not_pay_inline_replenish() -> None:
+    async def scenario() -> None:
+        pool = ClaudePool(**pool_kwargs(warm=1))
+        try:
+            warmup = await pool.ask("latency-warmup")
+            start = time.monotonic()
+            results = [await pool.ask(f"latency-{index}") for index in range(4)]
+
+            assert warmup.text == "latency-warmup"
+            assert [result.text for result in results] == [
+                "latency-0",
+                "latency-1",
+                "latency-2",
+                "latency-3",
+            ]
+            assert time.monotonic() - start < 1.5
+        finally:
+            await pool.aclose()
+
+    run(scenario())
+
+
 def test_fresh_context_per_plain_ask() -> None:
     async def scenario() -> None:
         pool = ClaudePool(**pool_kwargs())
@@ -112,6 +159,40 @@ def test_fresh_context_per_plain_ask() -> None:
             second = await pool.ask("two")
 
             assert first.session_id != second.session_id
+        finally:
+            await pool.aclose()
+
+    run(scenario())
+
+
+def test_missing_claude_binary_raises_worker_start_error_without_hanging() -> None:
+    async def scenario() -> None:
+        pool = ClaudePool(**pool_kwargs(claude_bin="/nonexistent/claude", warm=1))
+        try:
+            start = time.monotonic()
+            with pytest.raises(WorkerStartError) as exc_info:
+                await pool.ask("missing")
+
+            assert isinstance(exc_info.value, ClaudePoolError)
+            assert time.monotonic() - start < 5.0
+        finally:
+            await pool.aclose()
+
+    run(scenario())
+
+
+def test_warm_spawn_cooldown_does_not_block_cold_ask(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        wrapper = write_startup_fail_once_wrapper(tmp_path)
+        pool = ClaudePool(**pool_kwargs(claude_bin=str(wrapper), warm=1))
+        try:
+            await pool.start()
+
+            start = time.monotonic()
+            result = await pool.ask("after-cooldown")
+
+            assert result.text == "after-cooldown"
+            assert time.monotonic() - start < 2.0
         finally:
             await pool.aclose()
 
@@ -213,6 +294,23 @@ def test_aclose_retires_all_warm_workers() -> None:
 
         await pool.aclose()
 
+        for pgid in pgids:
+            await assert_process_group_gone(pgid)
+
+    run(scenario())
+
+
+def test_aclose_waits_for_in_flight_ask_and_reaps_process_group() -> None:
+    async def scenario() -> None:
+        pool = ClaudePool(**pool_kwargs(warm=0, max_workers=1))
+        task = asyncio.create_task(pool.ask("SLEEP:1"))
+        await asyncio.sleep(0.3)
+        pgids = tuple(_LIVE_PGIDS)
+
+        await pool.aclose()
+        result = await task
+
+        assert result.text == "SLEEP:1"
         for pgid in pgids:
             await assert_process_group_gone(pgid)
 

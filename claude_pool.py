@@ -396,10 +396,11 @@ class ClaudePool:
         if env is not None:
             self._env.update(env)
         self._warm_target = max(0, warm)
+        self._max_workers = max(1, max_workers)
         self._max_idle = max_idle
         self._default_timeout = default_timeout
         self._warm: deque[_Worker] = deque()
-        self._semaphore = asyncio.Semaphore(max(1, max_workers))
+        self._semaphore = asyncio.Semaphore(self._max_workers)
         self._closed = False
         self._started = False
         self._spawns_in_flight = 0
@@ -408,6 +409,7 @@ class ClaudePool:
         self._replenish_lock = asyncio.Lock()
         self._replenisher_task: asyncio.Task[None] | None = None
         self._sweeper_task: asyncio.Task[None] | None = None
+        self._reaper_tasks: set[asyncio.Task[None]] = set()
 
     @staticmethod
     def _build_argv(
@@ -453,11 +455,15 @@ class ClaudePool:
         """
         if self._closed:
             raise PoolClosed("pool is closed")
+        self._ensure_started()
+        await self._replenish_once()
+
+    def _ensure_started(self) -> None:
         if not self._started:
             self._started = True
             self._replenisher_task = asyncio.create_task(self._replenisher())
             self._sweeper_task = asyncio.create_task(self._sweeper())
-        await self._replenish_once()
+            self._replenish_event.set()
 
     async def ask(self, prompt: str, timeout: float | None = None) -> Result:
         """Send one prompt in a fresh context and return the completed result.
@@ -467,9 +473,12 @@ class ClaudePool:
         """
         if self._closed:
             raise PoolClosed("pool is closed")
-        await self.start()
+        self._ensure_started()
         ask_timeout = self._default_timeout if timeout is None else timeout
         await self._semaphore.acquire()
+        if self._closed:
+            self._semaphore.release()
+            raise PoolClosed("pool is closed")
         try:
             return await self._ask_with_worker(prompt, ask_timeout)
         finally:
@@ -496,9 +505,18 @@ class ClaudePool:
         for task in tasks:
             with suppress(asyncio.CancelledError):
                 await task
+        acquired = 0
+        for _ in range(self._max_workers):
+            await self._semaphore.acquire()
+            acquired += 1
         warm = list(self._warm)
         self._warm.clear()
-        await asyncio.gather(*(worker.retire() for worker in warm), return_exceptions=True)
+        for worker in warm:
+            self._reap(worker)
+        if self._reaper_tasks:
+            await asyncio.gather(*self._reaper_tasks, return_exceptions=True)
+        for _ in range(acquired):
+            self._semaphore.release()
 
     def ask_sync(self, prompt: str, timeout: float | None = None) -> Result:
         """Synchronously send one prompt in a fresh context.
@@ -544,28 +562,35 @@ class ClaudePool:
                     continue
                 raise
             finally:
-                await worker.retire()
+                self._reap(worker)
                 self._nudge_replenisher()
 
     async def _checkout_worker(self) -> tuple[_Worker, bool]:
         while self._warm:
             worker = self._warm.pop()
             if not worker.alive:
-                await worker.kill()
+                self._reap(worker, kill=True)
                 continue
             if time.monotonic() - worker.idle_since > self._max_idle:
-                await worker.retire()
+                self._reap(worker)
                 continue
             return worker, True
         return await self._spawn_worker(), False
 
     async def _spawn_worker(self) -> _Worker:
-        return await _Worker.spawn(self._argv, cwd=self._cwd, env=self._env)
+        try:
+            return await _Worker.spawn(self._argv, cwd=self._cwd, env=self._env)
+        except OSError as exc:
+            raise WorkerStartError(str(exc)) from exc
 
     async def _replenisher(self) -> None:
         while True:
-            await self._replenish_event.wait()
+            try:
+                await asyncio.wait_for(self._replenish_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
             self._replenish_event.clear()
+            self._discard_dead_warm()
             await self._replenish_once()
 
     async def _replenish_once(self) -> None:
@@ -573,8 +598,7 @@ class ClaudePool:
             while not self._closed and len(self._warm) + self._spawns_in_flight < self._warm_target:
                 cooldown_remaining = self._spawn_cooldown_until - time.monotonic()
                 if cooldown_remaining > 0:
-                    await asyncio.sleep(cooldown_remaining)
-                    continue
+                    return
                 self._spawns_in_flight += 1
                 worker: _Worker | None = None
                 try:
@@ -588,19 +612,19 @@ class ClaudePool:
                         logger.warning("%s", error)
                         self._spawn_cooldown_until = time.monotonic() + 30.0
                         await worker.kill()
-                        break
+                        return
                     if self._closed:
-                        await worker.retire()
+                        self._reap(worker)
                     else:
                         self._warm.append(worker)
                 except asyncio.CancelledError:
                     if worker is not None:
                         await worker.kill()
                     raise
-                except OSError as exc:
-                    error = WorkerStartError(str(exc))
-                    logger.warning("%s", error)
+                except WorkerStartError as exc:
+                    logger.warning("%s", exc)
                     self._spawn_cooldown_until = time.monotonic() + 30.0
+                    return
                 finally:
                     self._spawns_in_flight -= 1
 
@@ -619,12 +643,27 @@ class ClaudePool:
         while self._warm:
             worker = self._warm.popleft()
             if not worker.alive:
-                await worker.kill()
+                self._reap(worker, kill=True)
             elif now - worker.idle_since > self._max_idle:
-                await worker.retire()
+                self._reap(worker)
             else:
                 kept.append(worker)
         self._warm = kept
+
+    def _discard_dead_warm(self) -> None:
+        kept: deque[_Worker] = deque()
+        while self._warm:
+            worker = self._warm.popleft()
+            if worker.alive:
+                kept.append(worker)
+            else:
+                self._reap(worker, kill=True)
+        self._warm = kept
+
+    def _reap(self, worker: _Worker, *, kill: bool = False) -> None:
+        task = asyncio.create_task(worker.kill() if kill else worker.retire())
+        self._reaper_tasks.add(task)
+        task.add_done_callback(self._reaper_tasks.discard)
 
     def __enter__(self) -> ClaudePool:
         """Enter this synchronous pool context and return the pool."""
