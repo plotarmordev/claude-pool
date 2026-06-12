@@ -149,6 +149,7 @@ class _Worker:
             except asyncio.TimeoutError:
                 await self.kill()
                 return
+            self._signal_process_group()
             await self._finish_stderr_task(cancel=False)
         except asyncio.CancelledError:
             await asyncio.shield(self.kill())
