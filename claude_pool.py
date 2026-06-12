@@ -6,13 +6,14 @@ import atexit
 import asyncio
 from collections import deque
 from collections.abc import Mapping, Sequence
-from contextlib import AbstractAsyncContextManager, suppress
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, suppress
 from dataclasses import dataclass
 import json
 import logging
 import os
 import signal
 import sys
+import threading
 import time
 from types import TracebackType
 from typing import Any
@@ -332,18 +333,64 @@ class Session:
     worker failures, timeouts, or lifecycle violations.
     """
 
+    def __init__(self, pool: ClaudePool) -> None:
+        """Create an unentered session bound to ``pool``."""
+        self._pool = pool
+        self._worker: _Worker | None = None
+        self._send_lock = asyncio.Lock()
+        self._entered = False
+        self._exited = False
+        self._usable = False
+        self._semaphore_acquired = False
+
     async def send(self, prompt: str, timeout: float | None = None) -> Result:
         """Send one prompt on this session and return the completed result.
 
         Raises ``AskTimeout`` if the timeout elapses, ``WorkerCrashError`` if
-        the underlying worker exits mid-turn, and ``PoolClosed`` when the
+        the underlying worker exits mid-turn, and ``ClaudePoolError`` when the
         session is no longer usable.
         """
-        raise NotImplementedError
+        if not self._usable or self._worker is None:
+            raise ClaudePoolError("session closed")
+
+        async with self._send_lock:
+            if not self._usable or self._worker is None:
+                raise ClaudePoolError("session closed")
+            ask_timeout = self._pool._default_timeout if timeout is None else timeout
+            try:
+                result_message, rate_limit = await self._worker.ask(prompt, ask_timeout)
+            except (WorkerCrashError, AskTimeout):
+                self._usable = False
+                raise
+            except asyncio.CancelledError:
+                self._usable = False
+                raise
+            return Result.from_result_message(result_message, rate_limit)
 
     async def __aenter__(self) -> Session:
         """Enter this async session context and return the session."""
-        raise NotImplementedError
+        if self._entered or self._exited:
+            raise ClaudePoolError("session closed")
+        if self._pool._closed:
+            raise PoolClosed("pool is closed")
+
+        self._pool._ensure_started()
+        await self._pool._semaphore.acquire()
+        self._semaphore_acquired = True
+        if self._pool._closed:
+            self._release_semaphore()
+            raise PoolClosed("pool is closed")
+
+        try:
+            worker, _was_warm = await self._pool._checkout_worker()
+        except BaseException:
+            self._release_semaphore()
+            raise
+
+        self._worker = worker
+        self._entered = True
+        self._usable = True
+        return self
 
     async def __aexit__(
         self,
@@ -352,7 +399,56 @@ class Session:
         tb: TracebackType | None,
     ) -> bool | None:
         """Release this session's worker when leaving an async context."""
-        raise NotImplementedError
+        del exc_type, exc, tb
+        if self._exited:
+            return None
+
+        self._exited = True
+        self._usable = False
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            self._pool._reap(worker)
+            self._pool._nudge_replenisher()
+        self._release_semaphore()
+        return None
+
+    def _release_semaphore(self) -> None:
+        if self._semaphore_acquired:
+            self._semaphore_acquired = False
+            self._pool._semaphore.release()
+
+
+class _SyncSession:
+    def __init__(self, pool: ClaudePool) -> None:
+        self._pool = pool
+        self._session = Session(pool)
+        self._entered = False
+        self._closed = False
+
+    def send(self, prompt: str, timeout: float | None = None) -> Result:
+        if not self._entered or self._closed:
+            raise ClaudePoolError("session closed")
+        return self._pool._run_sync(self._session.send(prompt, timeout))
+
+    def __enter__(self) -> _SyncSession:
+        if self._entered or self._closed:
+            raise ClaudePoolError("session closed")
+        self._pool._run_sync(self._session.__aenter__())
+        self._entered = True
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        if self._closed:
+            return None
+        self._closed = True
+        self._pool._run_sync(self._session.__aexit__(exc_type, exc, tb))
+        return None
 
 
 class ClaudePool:
@@ -410,6 +506,9 @@ class ClaudePool:
         self._replenisher_task: asyncio.Task[None] | None = None
         self._sweeper_task: asyncio.Task[None] | None = None
         self._reaper_tasks: set[asyncio.Task[None]] = set()
+        self._mode: str | None = None
+        self._sync_loop: asyncio.AbstractEventLoop | None = None
+        self._sync_thread: threading.Thread | None = None
 
     @staticmethod
     def _build_argv(
@@ -452,7 +551,13 @@ class ClaudePool:
         """Start background pool maintenance and pre-warm configured workers.
 
         Raises ``PoolClosed`` when called after the pool has closed.
+        Calling this async method fixes the pool to async mode; later sync API
+        calls on the same pool raise ``ClaudePoolError``.
         """
+        self._use_async()
+        await self._start()
+
+    async def _start(self) -> None:
         if self._closed:
             raise PoolClosed("pool is closed")
         self._ensure_started()
@@ -470,7 +575,13 @@ class ClaudePool:
 
         Raises ``AskTimeout`` if the timeout elapses, ``WorkerCrashError`` if a
         worker exits mid-turn, and ``PoolClosed`` when the pool has closed.
+        Calling this async method fixes the pool to async mode; later sync API
+        calls on the same pool raise ``ClaudePoolError``.
         """
+        self._use_async()
+        return await self._ask(prompt, timeout)
+
+    async def _ask(self, prompt: str, timeout: float | None = None) -> Result:
         if self._closed:
             raise PoolClosed("pool is closed")
         self._ensure_started()
@@ -488,14 +599,25 @@ class ClaudePool:
         """Return an async context manager yielding a multi-turn ``Session``.
 
         Raises ``PoolClosed`` when the pool has closed.
+        Calling this async API fixes the pool to async mode; later sync API
+        calls on the same pool raise ``ClaudePoolError``.
         """
-        raise NotImplementedError
+        self._use_async()
+        if self._closed:
+            raise PoolClosed("pool is closed")
+        return Session(self)
 
     async def aclose(self) -> None:
         """Close the pool and release all workers.
 
         After this method completes, new work raises ``PoolClosed``.
+        Calling this async method fixes the pool to async mode; later sync API
+        calls on the same pool raise ``ClaudePoolError``.
         """
+        self._use_async()
+        await self._aclose()
+
+    async def _aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
@@ -522,13 +644,102 @@ class ClaudePool:
     def ask_sync(self, prompt: str, timeout: float | None = None) -> Result:
         """Synchronously send one prompt in a fresh context.
 
-        Raises the same exceptions as ``ask``.
+        Raises the same exceptions as ``ask``. Calling this sync method fixes
+        the pool to sync mode; later async API calls on the same pool raise
+        ``ClaudePoolError``.
         """
-        raise NotImplementedError
+        self._use_sync()
+        if self._closed:
+            raise PoolClosed("pool is closed")
+        return self._run_sync(self._ask(prompt, timeout))
+
+    def session_sync(self) -> AbstractContextManager[_SyncSession]:
+        """Return a sync context manager yielding a multi-turn session wrapper.
+
+        The returned object has a synchronous ``send(prompt, timeout=None)``
+        method mirroring ``Session.send``. Calling this sync method fixes the
+        pool to sync mode; later async API calls on the same pool raise
+        ``ClaudePoolError``.
+        """
+        self._use_sync()
+        if self._closed:
+            raise PoolClosed("pool is closed")
+        return _SyncSession(self)
 
     def close(self) -> None:
-        """Synchronously close the pool and release all workers."""
-        raise NotImplementedError
+        """Synchronously close the pool and release all workers.
+
+        Calling this sync method fixes the pool to sync mode; later async API
+        calls on the same pool raise ``ClaudePoolError``. Calling ``close`` on
+        a fresh pool that never started the sync loop only marks it closed.
+        """
+        self._use_sync()
+        if self._sync_loop is None:
+            self._closed = True
+            return
+        try:
+            self._run_sync(self._aclose())
+        finally:
+            self._stop_sync_loop()
+
+    def _use_async(self) -> None:
+        if self._mode is None:
+            self._mode = "async"
+        elif self._mode != "async":
+            raise ClaudePoolError(
+                "pool already used through sync API; create a separate pool for async use"
+            )
+
+    def _use_sync(self) -> None:
+        if self._mode is None:
+            self._mode = "sync"
+        elif self._mode != "sync":
+            raise ClaudePoolError(
+                "pool already used through async API; create a separate pool for sync use"
+            )
+
+    def _run_sync(self, coro: Any) -> Any:
+        loop = self._ensure_sync_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result()
+
+    def _ensure_sync_loop(self) -> asyncio.AbstractEventLoop:
+        if self._sync_loop is not None:
+            return self._sync_loop
+
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def run_loop() -> None:
+            asyncio.set_event_loop(loop)
+            ready.set()
+            loop.run_forever()
+
+        thread = threading.Thread(
+            target=run_loop,
+            name="claude-pool-sync-loop",
+            daemon=True,
+        )
+        self._sync_loop = loop
+        self._sync_thread = thread
+        thread.start()
+        ready.wait()
+        return loop
+
+    def _stop_sync_loop(self) -> None:
+        loop = self._sync_loop
+        thread = self._sync_thread
+        self._sync_loop = None
+        self._sync_thread = None
+        if loop is None:
+            return
+
+        loop.call_soon_threadsafe(loop.stop)
+        if thread is not None:
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                raise ClaudePoolError("sync event loop thread did not stop")
+        loop.close()
 
     async def __aenter__(self) -> ClaudePool:
         """Enter this async pool context and return the pool."""
@@ -671,7 +882,9 @@ class ClaudePool:
 
     def __enter__(self) -> ClaudePool:
         """Enter this synchronous pool context and return the pool."""
-        raise NotImplementedError
+        self._use_sync()
+        self._run_sync(self._start())
+        return self
 
     def __exit__(
         self,
@@ -680,7 +893,9 @@ class ClaudePool:
         tb: TracebackType | None,
     ) -> bool | None:
         """Close the pool when leaving a synchronous context."""
-        raise NotImplementedError
+        del exc_type, exc, tb
+        self.close()
+        return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
