@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import concurrent.futures
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Coroutine, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, suppress
 from dataclasses import dataclass
 import json
@@ -359,18 +360,24 @@ class Session:
             ask_timeout = self._pool._default_timeout if timeout is None else timeout
             try:
                 result_message, rate_limit = await self._worker.ask(prompt, ask_timeout)
-            except (WorkerCrashError, AskTimeout):
+            except (WorkerCrashError, AskTimeout) as exc:
                 self._usable = False
+                if self._exited:
+                    raise ClaudePoolError("session closed") from exc
                 raise
             except asyncio.CancelledError:
                 self._usable = False
                 raise
+            if self._exited:
+                self._usable = False
+                raise ClaudePoolError("session closed")
             return Result.from_result_message(result_message, rate_limit)
 
     async def __aenter__(self) -> Session:
         """Enter this async session context and return the session."""
         if self._entered or self._exited:
             raise ClaudePoolError("session closed")
+        self._entered = True
         if self._pool._closed:
             raise PoolClosed("pool is closed")
 
@@ -388,7 +395,6 @@ class Session:
             raise
 
         self._worker = worker
-        self._entered = True
         self._usable = True
         return self
 
@@ -509,6 +515,10 @@ class ClaudePool:
         self._mode: str | None = None
         self._sync_loop: asyncio.AbstractEventLoop | None = None
         self._sync_thread: threading.Thread | None = None
+        self._sync_mutex = threading.Lock()
+        self._sync_stopping = False
+        self._sync_stopped = threading.Event()
+        self._sync_inflight: set[concurrent.futures.Future[Any]] = set()
 
     @staticmethod
     def _build_argv(
@@ -674,39 +684,77 @@ class ClaudePool:
         a fresh pool that never started the sync loop only marks it closed.
         """
         self._use_sync()
-        if self._sync_loop is None:
-            self._closed = True
+        with self._sync_mutex:
+            if self._sync_stopping:
+                stopped = self._sync_stopped
+                wait_for_existing_close = True
+                loop = None
+            else:
+                self._sync_stopping = True
+                self._sync_stopped.clear()
+                stopped = self._sync_stopped
+                wait_for_existing_close = False
+                loop = self._sync_loop
+                if loop is None:
+                    self._closed = True
+                    self._sync_stopped.set()
+                    return
+
+        if wait_for_existing_close:
+            stopped.wait(timeout=30.0)
             return
+
         try:
-            self._run_sync(self._aclose())
+            close_future = asyncio.run_coroutine_threadsafe(self._aclose(), loop)
+            close_future.result()
+            concurrent.futures.wait(tuple(self._sync_inflight), timeout=10.0)
+            with self._sync_mutex:
+                self._stop_sync_loop_locked()
+        except BaseException:
+            with self._sync_mutex:
+                self._sync_stopping = False
+            raise
         finally:
-            self._stop_sync_loop()
+            stopped.set()
 
     def _use_async(self) -> None:
-        if self._mode is None:
-            self._mode = "async"
-        elif self._mode != "async":
-            raise ClaudePoolError(
-                "pool already used through sync API; create a separate pool for async use"
-            )
+        with self._sync_mutex:
+            if self._mode is None:
+                self._mode = "async"
+            elif self._mode != "async":
+                raise ClaudePoolError(
+                    "pool already used through sync API; create a separate pool for async use"
+                )
 
     def _use_sync(self) -> None:
-        if self._mode is None:
-            self._mode = "sync"
-        elif self._mode != "sync":
-            raise ClaudePoolError(
-                "pool already used through async API; create a separate pool for sync use"
-            )
+        with self._sync_mutex:
+            if self._mode is None:
+                self._mode = "sync"
+            elif self._mode != "sync":
+                raise ClaudePoolError(
+                    "pool already used through async API; create a separate pool for sync use"
+                )
 
-    def _run_sync(self, coro: Any) -> Any:
-        loop = self._ensure_sync_loop()
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
+    def _run_sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
+        with self._sync_mutex:
+            if self._sync_stopping:
+                coro.close()
+                raise PoolClosed("pool is closed")
+            loop = self._ensure_sync_loop_locked()
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            self._sync_inflight.add(future)
+            future.add_done_callback(lambda done: self._sync_inflight.discard(done))
         return future.result()
 
     def _ensure_sync_loop(self) -> asyncio.AbstractEventLoop:
+        with self._sync_mutex:
+            return self._ensure_sync_loop_locked()
+
+    def _ensure_sync_loop_locked(self) -> asyncio.AbstractEventLoop:
         if self._sync_loop is not None:
             return self._sync_loop
 
+        self._sync_stopped.clear()
         loop = asyncio.new_event_loop()
         ready = threading.Event()
 
@@ -726,11 +774,9 @@ class ClaudePool:
         ready.wait()
         return loop
 
-    def _stop_sync_loop(self) -> None:
+    def _stop_sync_loop_locked(self) -> None:
         loop = self._sync_loop
         thread = self._sync_thread
-        self._sync_loop = None
-        self._sync_thread = None
         if loop is None:
             return
 
@@ -740,6 +786,8 @@ class ClaudePool:
             if thread.is_alive():
                 raise ClaudePoolError("sync event loop thread did not stop")
         loop.close()
+        self._sync_loop = None
+        self._sync_thread = None
 
     async def __aenter__(self) -> ClaudePool:
         """Enter this async pool context and return the pool."""

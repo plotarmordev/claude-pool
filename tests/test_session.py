@@ -9,7 +9,14 @@ from typing import Any
 
 import pytest
 
-from claude_pool import AskTimeout, ClaudePool, ClaudePoolError, PoolClosed, WorkerCrashError
+from claude_pool import (
+    AskTimeout,
+    ClaudePool,
+    ClaudePoolError,
+    PoolClosed,
+    Result,
+    WorkerCrashError,
+)
 from claude_pool import _LIVE_PGIDS
 
 
@@ -73,6 +80,16 @@ def wait_for_thread_baseline(baseline: set[threading.Thread]) -> None:
         time.sleep(0.05)
     extra = set(threading.enumerate()) - baseline
     raise AssertionError(f"extra threads remain: {[thread.name for thread in extra]}")
+
+
+def join_threads(threads: list[threading.Thread], timeout: float = 15.0) -> None:
+    for thread in threads:
+        thread.join(timeout=timeout)
+        assert not thread.is_alive(), f"{thread.name} did not finish"
+
+
+def sync_loop_thread_count() -> int:
+    return sum(1 for thread in threading.enumerate() if thread.name == "claude-pool-sync-loop")
 
 
 def test_session_reuses_worker_between_plain_fresh_asks() -> None:
@@ -251,6 +268,56 @@ def test_double_aclose_and_double_session_exit_are_noops() -> None:
     run(scenario())
 
 
+def test_concurrent_session_double_enter_only_allows_one_entry() -> None:
+    async def scenario() -> None:
+        pool = ClaudePool(**pool_kwargs())
+        session_cm = pool.session()
+        try:
+            entries = await asyncio.gather(
+                session_cm.__aenter__(),
+                session_cm.__aenter__(),
+                return_exceptions=True,
+            )
+            successes = [entry for entry in entries if not isinstance(entry, BaseException)]
+            errors = [entry for entry in entries if isinstance(entry, BaseException)]
+
+            assert len(successes) == 1
+            assert len(errors) == 1
+            assert isinstance(errors[0], ClaudePoolError)
+
+            await session_cm.__aexit__(None, None, None)
+            await asyncio.wait_for(pool.aclose(), timeout=10.0)
+        finally:
+            await session_cm.__aexit__(None, None, None)
+            await pool.aclose()
+
+    run(scenario())
+
+
+def test_session_exit_during_send_reports_session_closed() -> None:
+    async def scenario() -> None:
+        pool = ClaudePool(**pool_kwargs())
+        session_cm = pool.session()
+        session = await session_cm.__aenter__()
+        assert session._worker is not None
+        pgid = session._worker._pgid
+        try:
+            send_task = asyncio.create_task(session.send("SLEEP:2"))
+            await asyncio.sleep(0.3)
+            await session_cm.__aexit__(None, None, None)
+
+            with pytest.raises(ClaudePoolError, match="session closed"):
+                await send_task
+
+            await pool.aclose()
+            await assert_process_group_gone(pgid)
+        finally:
+            await session_cm.__aexit__(None, None, None)
+            await pool.aclose()
+
+    run(scenario())
+
+
 def test_pool_context_managers_work() -> None:
     async def async_scenario() -> None:
         async with ClaudePool(**pool_kwargs()) as pool:
@@ -265,3 +332,127 @@ def test_pool_context_managers_work() -> None:
         assert result.text == "sync-context"
     wait_for_thread_baseline(baseline_threads)
     wait_for_no_live_process_groups()
+
+
+def test_concurrent_fresh_ask_sync_creates_one_loop_thread() -> None:
+    for iteration in range(10):
+        baseline_threads = set(threading.enumerate())
+        pool = ClaudePool(**pool_kwargs())
+        barrier = threading.Barrier(3)
+        results: list[Result] = []
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def ask_worker(prompt: str) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                result = pool.ask_sync(prompt)
+            except BaseException as exc:
+                with lock:
+                    errors.append(exc)
+            else:
+                with lock:
+                    results.append(result)
+
+        threads = [
+            threading.Thread(
+                target=ask_worker,
+                args=("SLEEP:0.1",),
+                name=f"ask-sync-race-{iteration}-{index}",
+            )
+            for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            barrier.wait(timeout=5.0)
+            max_loop_threads = sync_loop_thread_count()
+            while any(thread.is_alive() for thread in threads):
+                max_loop_threads = max(max_loop_threads, sync_loop_thread_count())
+                time.sleep(0.01)
+            join_threads(threads)
+
+            assert not errors
+            assert len(results) == 2
+            assert all(isinstance(result, Result) for result in results)
+            assert max_loop_threads <= 1
+
+            pool.close()
+            wait_for_thread_baseline(baseline_threads)
+            wait_for_no_live_process_groups()
+        finally:
+            join_threads(threads)
+            pool.close()
+
+
+def test_concurrent_close_calls_do_not_hang_or_leak() -> None:
+    for _iteration in range(10):
+        pool = ClaudePool(**pool_kwargs())
+        assert pool.ask_sync("before-close").text == "before-close"
+        barrier = threading.Barrier(3)
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def close_worker() -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                pool.close()
+            except BaseException as exc:
+                with lock:
+                    errors.append(exc)
+
+        threads = [
+            threading.Thread(target=close_worker, name=f"close-race-{index}") for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            barrier.wait(timeout=5.0)
+            join_threads(threads)
+
+            assert not errors
+            wait_for_no_live_process_groups()
+        finally:
+            join_threads(threads)
+            pool.close()
+
+
+def test_ask_sync_churn_during_close_returns_results_or_pool_closed() -> None:
+    pool = ClaudePool(**pool_kwargs(max_workers=4))
+    errors: list[BaseException] = []
+    results: list[Result] = []
+    lock = threading.Lock()
+
+    def churn_worker(index: int) -> None:
+        call_index = 0
+        while True:
+            try:
+                result = pool.ask_sync("SLEEP:0.05")
+            except PoolClosed:
+                return
+            except BaseException as exc:
+                with lock:
+                    errors.append(exc)
+                return
+            else:
+                with lock:
+                    results.append(result)
+                call_index += 1
+
+    threads = [
+        threading.Thread(target=churn_worker, args=(index,), name=f"sync-churn-{index}")
+        for index in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        time.sleep(0.2)
+        pool.close()
+        join_threads(threads)
+
+        assert results
+        assert not errors
+        wait_for_no_live_process_groups()
+    finally:
+        join_threads(threads)
+        pool.close()
