@@ -228,6 +228,21 @@ def test_worker_startup_auth_error_carries_login_stderr() -> None:
     run(scenario())
 
 
+def test_worker_crash_with_pipe_holding_child_raises_worker_crash_error() -> None:
+    async def scenario() -> None:
+        quoted = " ".join(shlex.quote(arg) for arg in fake_argv())
+        argv = ["/bin/sh", "-c", f"sleep 30 0<&- & exec {quoted}"]
+        worker = await spawn_fake(argv=argv, env={"FAKE_CLAUDE_STARTUP": "exit2"})
+        pgid = os.getpgid(worker.process.pid)
+        await asyncio.sleep(0.3)
+
+        with pytest.raises(WorkerCrashError):
+            await worker.ask("hello", timeout=None)
+        await assert_process_group_gone(pgid)
+
+    run(scenario())
+
+
 def test_worker_retire_kills_pipe_holding_child() -> None:
     async def scenario() -> None:
         quoted = " ".join(shlex.quote(arg) for arg in fake_argv())

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
-import select
+import queue
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,21 +81,29 @@ def _json_lines(stdout: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in stdout.splitlines()]
 
 
-def _read_turn(process: subprocess.Popen[str]) -> list[dict[str, Any]]:
+def _start_stdout_reader(process: subprocess.Popen[str]) -> queue.Queue[str | None]:
     assert process.stdout is not None
-    deadline = time.monotonic() + 15.0
-    lines = []
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([process.stdout], [], [], 0.1)
-        if not ready:
-            continue
-        line = process.stdout.readline()
-        assert line
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def read_stdout() -> None:
+        for line in process.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    thread = threading.Thread(target=read_stdout, daemon=True)
+    thread.start()
+    return lines
+
+
+def _read_turn(stdout_lines: queue.Queue[str | None]) -> list[dict[str, Any]]:
+    messages = []
+    while True:
+        line = stdout_lines.get(timeout=15.0)
+        assert line is not None
         message = json.loads(line)
-        lines.append(message)
+        messages.append(message)
         if message["type"] == "result":
-            return lines
-    raise AssertionError("timed out waiting for result")
+            return messages
 
 
 def test_default_echo_emits_schema_faithful_turn_and_exits_zero() -> None:
@@ -145,19 +156,20 @@ def test_fake_idles_until_stdin_message_and_reuses_interactive_session() -> None
     )
     assert process.stdin is not None
     assert process.stdout is not None
+    lines = _start_stdout_reader(process)
 
     try:
-        ready, _, _ = select.select([process.stdout], [], [], 0.3)
-        assert ready == []
+        with pytest.raises(queue.Empty):
+            lines.get(timeout=0.3)
         assert process.poll() is None
 
         process.stdin.write(f"{_user('first')}\n")
         process.stdin.flush()
-        first_turn = _read_turn(process)
+        first_turn = _read_turn(lines)
 
         process.stdin.write(f"{_user('second')}\n")
         process.stdin.flush()
-        second_turn = _read_turn(process)
+        second_turn = _read_turn(lines)
 
         first_init = first_turn[0]
         second_init = second_turn[0]

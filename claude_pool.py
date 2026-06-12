@@ -155,17 +155,20 @@ class _Worker:
             raise
 
     async def kill(self) -> None:
+        self._signal_process_group()
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        await self._finish_stderr_task(cancel=True)
+
+    def _signal_process_group(self) -> None:
         if not self._killed:
             self._killed = True
             try:
                 os.killpg(self._pgid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        try:
-            await asyncio.wait_for(self.process.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
-            pass
-        await self._finish_stderr_task(cancel=True)
 
     async def _ask(self, prompt: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if self.process.stdin is None or self.process.stdout is None:
@@ -238,8 +241,15 @@ class _Worker:
             await asyncio.wait_for(self.process.wait(), timeout=2.0)
         except asyncio.TimeoutError:
             await self.kill()
+        else:
+            self._signal_process_group()
 
     async def _finish_stderr_task(self, *, cancel: bool) -> None:
+        if self._stderr_task.done():
+            with suppress(asyncio.CancelledError):
+                await self._stderr_task
+            return
+
         if cancel:
             await self._cancel_stderr_task()
             return
