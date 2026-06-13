@@ -361,7 +361,7 @@ def _build_tui_argv(
     if effort is not None:
         argv.extend(["--effort", effort])
     if system_prompt is not None:
-        argv.extend(["--append-system-prompt", system_prompt])
+        argv.extend(["--system-prompt", system_prompt])
     if allowed_tools is not None:
         argv.extend(["--allowedTools", ",".join(allowed_tools)])
     if disallowed_tools is not None:
@@ -371,6 +371,21 @@ def _build_tui_argv(
     if extra_args is not None:
         argv.extend(extra_args)
     return argv
+
+
+def _sanitize_tui_prompt(prompt: str) -> str:
+    """Return prompt text safe for TUI bracketed paste.
+
+    Carriage returns are normalized to newlines. Other C0 control characters
+    and DEL are removed, except tab and newline. This is lossy for control
+    characters by design so prompt content cannot break paste framing.
+    """
+    normalized = prompt.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(
+        char
+        for char in normalized
+        if char in {"\n", "\t"} or (ord(char) >= 0x20 and ord(char) != 0x7F)
+    )
 
 
 def _default_tui_cwd() -> str:
@@ -566,7 +581,11 @@ class _TuiWorker:
 
         try:
             await self._sleep_until_first_paste_ready(deadline)
-            await self._write_master(b"\x1b[200~" + prompt.encode() + b"\x1b[201~", deadline)
+            sanitized_prompt = _sanitize_tui_prompt(prompt)
+            await self._write_master(
+                b"\x1b[200~" + sanitized_prompt.encode() + b"\x1b[201~",
+                deadline,
+            )
             await self._sleep_with_deadline(_TUI_PASTE_TO_CR, deadline)
             await self._write_master(b"\r", deadline)
         except AskTimeout:

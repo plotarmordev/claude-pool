@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-06-13
+
+### Fixed
+
+- TUI `system_prompt` now replaces the session system prompt instead of appending to it.
+- TUI prompts are sanitized of control characters before bracketed paste.
+
 ## [0.2.0] - 2026-06-13
 
 ### Added
