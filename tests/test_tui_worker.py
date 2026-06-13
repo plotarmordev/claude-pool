@@ -86,9 +86,9 @@ def test_build_tui_argv_uses_replacing_system_prompt() -> None:
 
 
 def test_sanitize_tui_prompt_policy() -> None:
-    prompt = "a\r\nb\rc\x00d\x7fe\tf\n\x1b[201~"
+    prompt = "a\r\nb\rc\x00d\x7fe\tf\n\x1b[201~\u0085\u009b\u00a0é"
 
-    assert _sanitize_tui_prompt(prompt) == "a\nb\ncde\tf\n[201~"
+    assert _sanitize_tui_prompt(prompt) == "a\nb\ncde\tf\n[201~\u00a0é"
 
 
 def test_tui_worker_happy_echo_and_result_conversion() -> None:
@@ -139,10 +139,12 @@ def test_tui_worker_sanitizes_prompt_before_paste() -> None:
                 "first\r\nsecond\rthird\x00four\x7f\tfive\nsix",
                 timeout=5.0,
             )
+            c1_controls, _rate_limit = await worker.ask("keep\u009bgoing", timeout=5.0)
 
             assert injected["result"] == "before[201~after"
             assert "\x1b" not in injected["result"]
             assert controls["result"] == "first\nsecond\nthirdfour\tfive\nsix"
+            assert c1_controls["result"] == "keepgoing"
         finally:
             await worker.retire()
 

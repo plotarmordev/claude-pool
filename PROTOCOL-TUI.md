@@ -65,7 +65,8 @@ is intentionally lossy for terminal control characters:
 - Normalize CRLF and lone CR to LF.
 - Preserve LF (`\n`) and tab (`\t`).
 - Remove all other C0 control characters (`\x00`-`\x08`, `\x0b`, `\x0c`,
-  `\x0e`-`\x1f`) and DEL (`\x7f`).
+  `\x0e`-`\x1f`), DEL (`\x7f`), and Unicode C1 controls
+  (`U+0080`-`U+009F`).
 
 This removes every ESC byte from prompt content, so embedded text such as
 `ESC [ 201 ~` cannot terminate the bracketed paste frame early.
