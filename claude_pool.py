@@ -376,15 +376,16 @@ def _build_tui_argv(
 def _sanitize_tui_prompt(prompt: str) -> str:
     """Return prompt text safe for TUI bracketed paste.
 
-    Carriage returns are normalized to newlines. Other C0 control characters
-    and DEL are removed, except tab and newline. This is lossy for control
-    characters by design so prompt content cannot break paste framing.
+    Carriage returns are normalized to newlines. Other C0 control characters,
+    DEL, and Unicode C1 controls are removed, except tab and newline. This is
+    lossy for control characters by design so prompt content cannot break paste
+    framing.
     """
     normalized = prompt.replace("\r\n", "\n").replace("\r", "\n")
     return "".join(
         char
         for char in normalized
-        if char in {"\n", "\t"} or (ord(char) >= 0x20 and ord(char) != 0x7F)
+        if char in {"\n", "\t"} or (0x20 <= ord(char) <= 0x7E) or ord(char) >= 0xA0
     )
 
 

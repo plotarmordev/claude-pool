@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] - 2026-06-13
+
+### Fixed
+
+- TUI prompt sanitization now also strips Unicode C1 control characters.
+
 ## [0.2.1] - 2026-06-13
 
 ### Fixed
