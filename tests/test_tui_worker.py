@@ -19,6 +19,8 @@ from claude_pool import (
     WorkerStartError,
     _LIVE_PGIDS,
     _TuiWorker,
+    _build_tui_argv,
+    _sanitize_tui_prompt,
 )
 
 
@@ -75,6 +77,20 @@ def shell_wrapped_fake() -> list[str]:
     return ["/bin/sh", "-c", f'sleep 30 & exec {quoted} "$@"', "fake-sh"]
 
 
+def test_build_tui_argv_uses_replacing_system_prompt() -> None:
+    argv = _build_tui_argv(["claude"], system_prompt="replace prompt")
+
+    assert "--system-prompt" in argv
+    assert argv[argv.index("--system-prompt") + 1] == "replace prompt"
+    assert "--append-system-prompt" not in argv
+
+
+def test_sanitize_tui_prompt_policy() -> None:
+    prompt = "a\r\nb\rc\x00d\x7fe\tf\n\x1b[201~"
+
+    assert _sanitize_tui_prompt(prompt) == "a\nb\ncde\tf\n[201~"
+
+
 def test_tui_worker_happy_echo_and_result_conversion() -> None:
     async def scenario() -> None:
         worker = await spawn_fake()
@@ -108,6 +124,25 @@ def test_tui_worker_retries_submit_when_first_enter_is_swallowed() -> None:
             assert result_message["result"] == "retry-submit"
             assert worker._last_ask_cr_retries == 1
             assert time.monotonic() - started < 5.0
+        finally:
+            await worker.retire()
+
+    run(scenario())
+
+
+def test_tui_worker_sanitizes_prompt_before_paste() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake()
+        try:
+            injected, _rate_limit = await worker.ask("before\x1b[201~after", timeout=5.0)
+            controls, _rate_limit = await worker.ask(
+                "first\r\nsecond\rthird\x00four\x7f\tfive\nsix",
+                timeout=5.0,
+            )
+
+            assert injected["result"] == "before[201~after"
+            assert "\x1b" not in injected["result"]
+            assert controls["result"] == "first\nsecond\nthirdfour\tfive\nsix"
         finally:
             await worker.retire()
 

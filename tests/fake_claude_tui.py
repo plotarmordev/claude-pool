@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--settings", required=True)
     parser.add_argument("--model")
     parser.add_argument("--effort")
+    parser.add_argument("--system-prompt")
     parser.add_argument("--append-system-prompt")
     parser.add_argument("--allowedTools")
     parser.add_argument("--disallowedTools")

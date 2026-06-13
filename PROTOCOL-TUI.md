@@ -15,6 +15,11 @@ The worker starts:
 claude --session-id <uuid> --settings <settings.json> [profile flags]
 ```
 
+Profile flags match stream-json backend semantics where the interactive CLI
+supports them. In particular, `system_prompt` is passed as `--system-prompt`,
+which replaces the session system prompt. It is not passed as
+`--append-system-prompt`.
+
 The generated settings file registers `SessionStart` and `Stop` hooks:
 
 ```json
@@ -51,6 +56,19 @@ Observed submit timing on Claude Code 2.1.175:
   send one additional carriage return. Pressing Enter on an empty input box is
   a no-op; if the first carriage return was swallowed while the TUI was still
   processing paste insertion, the retry submits the existing prompt.
+
+## Prompt sanitization
+
+Prompt text is sanitized before it is written into bracketed paste. The policy
+is intentionally lossy for terminal control characters:
+
+- Normalize CRLF and lone CR to LF.
+- Preserve LF (`\n`) and tab (`\t`).
+- Remove all other C0 control characters (`\x00`-`\x08`, `\x0b`, `\x0c`,
+  `\x0e`-`\x1f`) and DEL (`\x7f`).
+
+This removes every ESC byte from prompt content, so embedded text such as
+`ESC [ 201 ~` cannot terminate the bracketed paste frame early.
 
 The Stop hook receives a JSON object on stdin at the end of a turn and appends
 one JSON line to the worker hook file. Observed payload fields include:
