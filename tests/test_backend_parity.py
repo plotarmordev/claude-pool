@@ -10,7 +10,14 @@ from typing import Any
 import pytest
 
 import claude_pool
-from claude_pool import AskTimeout, ClaudePool, ClaudePoolError, PoolClosed, _LIVE_PGIDS
+from claude_pool import (
+    AskTimeout,
+    ClaudePool,
+    ClaudePoolError,
+    PoolClosed,
+    WorkerStartError,
+    _LIVE_PGIDS,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +58,17 @@ def pool_kwargs(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
     }
     kwargs.update(overrides)
     return kwargs
+
+
+def tui_pool_kwargs(**overrides: Any) -> dict[str, Any]:
+    return pool_kwargs(
+        {
+            "backend": "tui",
+            "claude_bin": sys.executable,
+            "extra_args": [str(TUI_FAKE)],
+        },
+        **overrides,
+    )
 
 
 async def wait_for_warm(pool: ClaudePool, count: int) -> None:
@@ -197,6 +215,59 @@ def test_backend_timeout_kills_group(config: dict[str, Any]) -> None:
             await pool.aclose()
 
         await assert_no_live_process_groups()
+
+    run(scenario())
+
+
+def test_pool_tui_ready_timeout_is_configurable() -> None:
+    async def scenario() -> None:
+        pool = ClaudePool(
+            **tui_pool_kwargs(tui_ready_timeout=0.5, env={"FAKE_TUI_SLOW_START": "10"})
+        )
+        try:
+            started = time.monotonic()
+            with pytest.raises(WorkerStartError, match="did not become ready"):
+                await pool.ask("never-ready")
+
+            assert time.monotonic() - started < 5.0
+        finally:
+            await pool.aclose()
+
+    run(scenario())
+
+
+def test_pool_spawn_concurrency_serializes_cold_starts() -> None:
+    async def scenario() -> None:
+        pool = ClaudePool(**tui_pool_kwargs(spawn_concurrency=1, env={"FAKE_TUI_SLOW_START": "1"}))
+        workers: list[Any] = []
+        try:
+            started = time.monotonic()
+            workers = list(await asyncio.gather(pool._spawn_worker(), pool._spawn_worker()))
+
+            assert time.monotonic() - started >= 2.0
+        finally:
+            for worker in workers:
+                await worker.kill()
+            await pool.aclose()
+            await assert_no_live_process_groups()
+
+    run(scenario())
+
+
+def test_pool_spawn_concurrency_default_allows_overlapping_cold_starts() -> None:
+    async def scenario() -> None:
+        pool = ClaudePool(**tui_pool_kwargs(env={"FAKE_TUI_SLOW_START": "1"}))
+        workers: list[Any] = []
+        try:
+            started = time.monotonic()
+            workers = list(await asyncio.gather(pool._spawn_worker(), pool._spawn_worker()))
+
+            assert time.monotonic() - started < 2.0
+        finally:
+            for worker in workers:
+                await worker.kill()
+            await pool.aclose()
+            await assert_no_live_process_groups()
 
     run(scenario())
 

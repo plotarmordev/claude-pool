@@ -160,6 +160,26 @@ def test_serve_and_ask_round_trip(tmp_path: Path) -> None:
         wait_for_no_fake_processes()
 
 
+def test_serve_accepts_spawn_tuning_flags(tmp_path: Path) -> None:
+    process, socket_path = start_server(
+        tmp_path,
+        "--warm",
+        "0",
+        "--tui-ready-timeout",
+        "45",
+        "--spawn-concurrency",
+        "2",
+    )
+    try:
+        completed = run_cli(["ask", "tuned", "--socket", str(socket_path)])
+
+        assert completed.returncode == 0
+        assert completed.stdout.strip() == "tuned"
+    finally:
+        stop_server(process)
+        wait_for_no_fake_processes()
+
+
 def test_ask_response_includes_duration_and_rate_limit(tmp_path: Path) -> None:
     process, socket_path = start_server(tmp_path, "--warm", "0")
     try:

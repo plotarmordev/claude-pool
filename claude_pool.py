@@ -39,6 +39,7 @@ _STDERR_LIMIT = 64 * 1024
 _TUI_FIRST_PASTE_SETTLE = 0.75
 _TUI_PASTE_TO_CR = 0.3
 _TUI_CR_RETRY_AFTER = 3.0
+_TUI_READY_TIMEOUT = 30.0
 _LIVE_PGIDS: set[int] = set()
 logger = logging.getLogger("claude_pool")
 
@@ -438,6 +439,8 @@ class _TuiWorker:
         argv: Sequence[str],
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
+        *,
+        ready_timeout: float = _TUI_READY_TIMEOUT,
     ) -> _TuiWorker:
         if os.name != "posix" or pty is None:
             raise NotImplementedError("TUI workers require POSIX ptys")
@@ -512,7 +515,7 @@ class _TuiWorker:
                 session_id=session_id,
             )
             master_fd = None
-            await worker._wait_ready()
+            await worker._wait_ready(ready_timeout)
             return worker
         except BaseException:
             if worker is not None:
@@ -669,8 +672,8 @@ class _TuiWorker:
             with self._tail_lock:
                 self._pty_tail.append(chunk)
 
-    async def _wait_ready(self) -> None:
-        deadline = time.monotonic() + 30.0
+    async def _wait_ready(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
         trust_answered = False
         while True:
             if self.process.returncode is not None:
@@ -993,11 +996,19 @@ class ClaudePool:
         max_idle: float = 900.0,
         default_timeout: float = 600.0,
         backend: str = "stream-json",
+        tui_ready_timeout: float = _TUI_READY_TIMEOUT,
+        spawn_concurrency: int | None = None,
     ) -> None:
         """Create a pool configuration without starting workers.
 
         ``backend`` selects the worker transport: ``"stream-json"`` for Claude
         Code print mode, or ``"tui"`` for plain Claude Code in a pty.
+
+        ``tui_ready_timeout`` is the number of seconds a TUI worker may take to
+        signal readiness through its SessionStart hook before its spawn fails
+        with ``WorkerStartError``. ``spawn_concurrency`` caps how many worker
+        cold starts may run at the same time across the pool; ``None`` keeps
+        spawning unbounded.
         """
         if backend not in {"stream-json", "tui"}:
             raise ClaudePoolError(f"unknown backend: {backend}")
@@ -1033,6 +1044,10 @@ class ClaudePool:
         self._max_workers = max(1, max_workers)
         self._max_idle = max_idle
         self._default_timeout = default_timeout
+        self._tui_ready_timeout = tui_ready_timeout
+        self._spawn_semaphore = (
+            asyncio.Semaphore(max(1, spawn_concurrency)) if spawn_concurrency is not None else None
+        )
         self._warm: deque[_Worker | _TuiWorker] = deque()
         self._semaphore = asyncio.Semaphore(self._max_workers)
         self._closed = False
@@ -1376,9 +1391,20 @@ class ClaudePool:
         return await self._spawn_worker(), False
 
     async def _spawn_worker(self) -> _Worker | _TuiWorker:
+        if self._spawn_semaphore is not None:
+            async with self._spawn_semaphore:
+                return await self._spawn_worker_now()
+        return await self._spawn_worker_now()
+
+    async def _spawn_worker_now(self) -> _Worker | _TuiWorker:
         try:
             if self._backend == "tui":
-                return await _TuiWorker.spawn(self._tui_argv, cwd=self._cwd, env=self._env)
+                return await _TuiWorker.spawn(
+                    self._tui_argv,
+                    cwd=self._cwd,
+                    env=self._env,
+                    ready_timeout=self._tui_ready_timeout,
+                )
             return await _Worker.spawn(self._argv, cwd=self._cwd, env=self._env)
         except OSError as exc:
             raise WorkerStartError(str(exc)) from exc
@@ -1537,6 +1563,8 @@ def _pool_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "max_idle": args.max_idle,
         "default_timeout": args.default_timeout,
         "backend": args.backend,
+        "tui_ready_timeout": args.tui_ready_timeout,
+        "spawn_concurrency": args.spawn_concurrency,
     }
 
 
@@ -1886,6 +1914,8 @@ def _add_profile_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument("--max-idle", type=float, default=900.0)
     parser.add_argument("--default-timeout", type=float, default=600.0)
+    parser.add_argument("--tui-ready-timeout", type=float, default=_TUI_READY_TIMEOUT)
+    parser.add_argument("--spawn-concurrency", type=int)
     parser.add_argument("--socket")
 
 

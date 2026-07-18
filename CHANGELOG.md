@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- `ClaudePool(tui_ready_timeout=...)` and `claude-pool serve --tui-ready-timeout` to configure
+  the TUI worker readiness deadline. The default is unchanged at 30 seconds.
+- `ClaudePool(spawn_concurrency=...)` and `claude-pool serve --spawn-concurrency` to cap
+  simultaneous worker cold starts. The default is unchanged: unbounded.
+
 ## [0.2.2] - 2026-06-13
 
 ### Fixed
