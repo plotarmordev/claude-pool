@@ -119,6 +119,32 @@ Choose a backend with `ClaudePool(backend=...)` or `claude-pool serve --backend`
 | `stream-json` | You want structured metadata including usage, cost, duration, and rate-limit events. | Uses Claude Code print mode (`claude -p`). This is the default. |
 | `tui` | You need to avoid print mode and drive plain `claude` in a pty. | Text-first result metadata, best-effort usage extraction, and heavier worker startup. |
 
+## Startup Tuning
+
+Two constructor arguments control worker cold starts. Both default to the
+original behavior.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `tui_ready_timeout` | `30.0` | Seconds a TUI worker may take to signal readiness through its SessionStart hook before its spawn fails with `WorkerStartError`. |
+| `spawn_concurrency` | `None` | Maximum simultaneous worker cold starts across the pool. `None` leaves spawning unbounded. |
+
+On slow hosts such as single-board computers, several TUI workers cold-starting
+at the same time can push each one past the 30-second readiness deadline, so a
+process restart fails with `WorkerStartError` even though each worker would
+have started fine on its own. Raising `tui_ready_timeout` and capping
+`spawn_concurrency` keeps those restarts calm:
+
+```python
+pool = ClaudePool(backend="tui", warm=2, tui_ready_timeout=75.0, spawn_concurrency=2)
+```
+
+The daemon accepts the same knobs:
+
+```sh
+claude-pool serve --backend tui --warm 2 --tui-ready-timeout 75 --spawn-concurrency 2
+```
+
 ## How It Works
 
 ```text

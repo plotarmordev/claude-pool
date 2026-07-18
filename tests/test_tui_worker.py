@@ -40,11 +40,15 @@ async def spawn_fake(
     *,
     env: dict[str, str] | None = None,
     argv: list[str] | None = None,
+    ready_timeout: float | None = None,
 ) -> _TuiWorker:
     full_env = os.environ.copy()
     if env:
         full_env.update(env)
-    return await _TuiWorker.spawn(argv or fake_command(), env=full_env)
+    kwargs: dict[str, Any] = {}
+    if ready_timeout is not None:
+        kwargs["ready_timeout"] = ready_timeout
+    return await _TuiWorker.spawn(argv or fake_command(), env=full_env, **kwargs)
 
 
 async def assert_process_group_gone(pgid: int) -> None:
@@ -185,6 +189,31 @@ def test_tui_worker_waits_for_session_start_hook_before_ask() -> None:
             result_message, _rate_limit = await worker.ask("after-start", timeout=5.0)
 
             assert result_message["result"] == "after-start"
+        finally:
+            await worker.retire()
+
+    run(scenario())
+
+
+def test_tui_worker_ready_timeout_shorter_than_startup_fails_fast() -> None:
+    async def scenario() -> None:
+        started = time.monotonic()
+        with pytest.raises(WorkerStartError, match="did not become ready"):
+            await spawn_fake(env={"FAKE_TUI_SLOW_START": "10"}, ready_timeout=0.5)
+
+        assert time.monotonic() - started < 5.0
+        await assert_no_tui_reader_threads()
+
+    run(scenario())
+
+
+def test_tui_worker_ready_timeout_covers_slow_startup() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake(env={"FAKE_TUI_SLOW_START": "1"}, ready_timeout=15.0)
+        try:
+            result_message, _rate_limit = await worker.ask("slow-but-ready", timeout=5.0)
+
+            assert result_message["result"] == "slow-but-ready"
         finally:
             await worker.retire()
 
