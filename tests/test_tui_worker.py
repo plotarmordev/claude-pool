@@ -15,6 +15,7 @@ import pytest
 from claude_pool import (
     AskTimeout,
     Result,
+    WorkerAuthError,
     WorkerCrashError,
     WorkerStartError,
     _LIVE_PGIDS,
@@ -232,10 +233,37 @@ def test_tui_worker_startup_exit_raises_worker_start_error() -> None:
 
 def test_tui_worker_startup_auth_error_carries_login_tail() -> None:
     async def scenario() -> None:
-        with pytest.raises(WorkerStartError) as raised:
+        with pytest.raises(WorkerAuthError) as raised:
             await spawn_fake(env={"FAKE_TUI_STARTUP": "autherr"})
 
         assert "Please run /login" in raised.value.stderr_tail
+        assert raised.value.marker == "invalid api key"
+
+    run(scenario())
+
+
+def test_tui_worker_auth_output_fails_before_ready_timeout() -> None:
+    async def scenario() -> None:
+        started = time.monotonic()
+        with pytest.raises(WorkerAuthError) as raised:
+            await spawn_fake(env={"FAKE_TUI_STARTUP": "authstall"}, ready_timeout=10.0)
+
+        assert raised.value.marker == "failed to authenticate"
+        assert "OAuth session expired" in raised.value.stdout_tail
+        assert time.monotonic() - started < 2.0
+        await assert_no_tui_reader_threads()
+
+    run(scenario())
+
+
+def test_tui_worker_rate_limit_output_does_not_trigger_auth_error() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake(env={"FAKE_TUI_STARTUP": "ratelimit"})
+        try:
+            result_message, _rate_limit = await worker.ask("healthy", timeout=5.0)
+            assert result_message["result"] == "healthy"
+        finally:
+            await worker.retire()
 
     run(scenario())
 

@@ -40,6 +40,13 @@ _TUI_FIRST_PASTE_SETTLE = 0.75
 _TUI_PASTE_TO_CR = 0.3
 _TUI_CR_RETRY_AFTER = 3.0
 _TUI_READY_TIMEOUT = 30.0
+AUTH_FAILURE_MARKERS = (
+    "failed to authenticate",
+    "oauth session expired",
+    "invalid api key",
+    "please run /login",
+    "not logged in",
+)
 _LIVE_PGIDS: set[int] = set()
 logger = logging.getLogger("claude_pool")
 
@@ -118,6 +125,11 @@ class _TailBuffer:
         return self._data.decode(errors="replace")
 
 
+def _auth_failure_marker(*tails: str) -> str | None:
+    lowered = "\n".join(tails).lower()
+    return next((marker for marker in AUTH_FAILURE_MARKERS if marker.lower() in lowered), None)
+
+
 class _Worker:
     def __init__(self, process: asyncio.subprocess.Process) -> None:
         self.process = process
@@ -125,7 +137,9 @@ class _Worker:
         _LIVE_PGIDS.add(self._pgid)
         self.spawned_at = time.monotonic()
         self.idle_since = self.spawned_at
+        self._stdout = _TailBuffer(_STDERR_LIMIT)
         self._stderr = _TailBuffer(_STDERR_LIMIT)
+        self._auth_failure = asyncio.Event()
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         self._ask_lock = asyncio.Lock()
         self._killed = False
@@ -152,6 +166,10 @@ class _Worker:
     @property
     def stderr_tail(self) -> str:
         return self._stderr.text()
+
+    @property
+    def stdout_tail(self) -> str:
+        return self._stdout.text()
 
     @property
     def alive(self) -> bool:
@@ -212,7 +230,9 @@ class _Worker:
 
     async def _ask(self, prompt: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if self.process.stdin is None or self.process.stdout is None:
-            raise WorkerCrashError("worker pipes are unavailable", stderr_tail=self.stderr_tail)
+            raise self._crash_error("worker pipes are unavailable")
+
+        await self._raise_auth_failure_if_present()
 
         payload = {
             "type": "user",
@@ -228,14 +248,12 @@ class _Worker:
         except (BrokenPipeError, ConnectionResetError) as exc:
             await self._wait_after_crash()
             await self._finish_stderr_task(cancel=False)
-            raise WorkerCrashError(
-                "worker exited before accepting input", self.stderr_tail
-            ) from exc
+            raise self._crash_error("worker exited before accepting input") from exc
 
         rate_limit: dict[str, Any] | None = None
         while True:
             try:
-                raw = await self.process.stdout.readline()
+                raw = await self._read_stdout_line()
             except (ValueError, asyncio.LimitOverrunError) as exc:
                 await self.kill()
                 raise WorkerCrashError(
@@ -244,11 +262,14 @@ class _Worker:
             if raw == b"":
                 await self._wait_after_crash()
                 await self._finish_stderr_task(cancel=False)
-                raise WorkerCrashError("worker exited before result", stderr_tail=self.stderr_tail)
+                raise self._crash_error("worker exited before result")
+
+            self._stdout.append(raw)
 
             try:
                 message = json.loads(raw.decode(errors="replace"))
             except json.JSONDecodeError:
+                await self._raise_auth_failure_if_present()
                 continue
             if not isinstance(message, dict):
                 continue
@@ -268,6 +289,54 @@ class _Worker:
             if not chunk:
                 return
             self._stderr.append(chunk)
+            if _auth_failure_marker(self.stderr_tail) is not None:
+                self._auth_failure.set()
+
+    async def _read_stdout_line(self) -> bytes:
+        if self.process.stdout is None:
+            return b""
+        reader = asyncio.create_task(self.process.stdout.readline())
+        auth_waiter = asyncio.create_task(self._auth_failure.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {reader, auth_waiter}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if auth_waiter in done and self._auth_failure.is_set():
+                await self._raise_auth_failure_if_present()
+            return await reader
+        finally:
+            for task in (reader, auth_waiter):
+                if not task.done():
+                    task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    async def _raise_auth_failure_if_present(self) -> None:
+        stderr_tail = self.stderr_tail
+        stdout_tail = self.stdout_tail
+        marker = _auth_failure_marker(stderr_tail, stdout_tail)
+        if marker is None:
+            return
+        await self.kill()
+        raise WorkerAuthError(
+            "worker authentication failed",
+            marker=marker,
+            stderr_tail=stderr_tail,
+            stdout_tail=stdout_tail,
+        )
+
+    def _crash_error(self, message: str) -> WorkerCrashError | WorkerAuthError:
+        stderr_tail = self.stderr_tail
+        stdout_tail = self.stdout_tail
+        marker = _auth_failure_marker(stderr_tail, stdout_tail)
+        if marker is not None:
+            return WorkerAuthError(
+                message,
+                marker=marker,
+                stderr_tail=stderr_tail,
+                stdout_tail=stdout_tail,
+            )
+        return WorkerCrashError(message, stderr_tail=stderr_tail)
 
     async def _close_stdin(self) -> None:
         if self.process.stdin is None or self.process.stdin.is_closing():
@@ -323,6 +392,26 @@ class WorkerStartError(ClaudePoolError):
     def __init__(self, message: str, stderr_tail: str = "") -> None:
         super().__init__(message)
         self.stderr_tail = stderr_tail
+
+
+class WorkerAuthError(WorkerStartError):
+    """Raised when worker startup output indicates an authentication failure.
+
+    ``marker`` is the entry from ``AUTH_FAILURE_MARKERS`` that matched.
+    ``stderr_tail`` and ``stdout_tail`` contain bounded trailing process output.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        marker: str,
+        stderr_tail: str = "",
+        stdout_tail: str = "",
+    ) -> None:
+        super().__init__(message, stderr_tail=stderr_tail)
+        self.marker = marker
+        self.stdout_tail = stdout_tail
 
 
 class WorkerCrashError(ClaudePoolError):
@@ -676,10 +765,30 @@ class _TuiWorker:
         deadline = time.monotonic() + timeout
         trust_answered = False
         while True:
-            if self.process.returncode is not None:
-                raise WorkerStartError("TUI worker exited during startup", self.stderr_tail)
-
             tail = self.stderr_tail
+            marker = _auth_failure_marker(tail)
+            if marker is not None:
+                await self.kill()
+                raise WorkerAuthError(
+                    "TUI worker authentication failed",
+                    marker=marker,
+                    stderr_tail=tail,
+                    stdout_tail=tail,
+                )
+
+            if self.process.returncode is not None:
+                await self.kill()
+                tail = self.stderr_tail
+                marker = _auth_failure_marker(tail)
+                if marker is not None:
+                    raise WorkerAuthError(
+                        "TUI worker authentication failed",
+                        marker=marker,
+                        stderr_tail=tail,
+                        stdout_tail=tail,
+                    )
+                raise WorkerStartError("TUI worker exited during startup", tail)
+
             lowered = tail.lower()
             if not trust_answered and "trust" in lowered:
                 with suppress(OSError, AskTimeout):
@@ -874,7 +983,7 @@ class Session:
             ask_timeout = self._pool._default_timeout if timeout is None else timeout
             try:
                 result_message, rate_limit = await self._worker.ask(prompt, ask_timeout)
-            except (WorkerCrashError, AskTimeout) as exc:
+            except (WorkerAuthError, WorkerCrashError, AskTimeout) as exc:
                 self._usable = False
                 if self._exited:
                     raise ClaudePoolError("session closed") from exc
@@ -1434,10 +1543,24 @@ class ClaudePool:
                     worker = await self._spawn_worker()
                     await asyncio.sleep(0.5)
                     if not worker.alive:
-                        error = WorkerStartError(
-                            "warm worker exited during startup",
-                            stderr_tail=worker.stderr_tail,
+                        stderr_tail = worker.stderr_tail
+                        stdout_tail = (
+                            worker.stdout_tail if isinstance(worker, _Worker) else stderr_tail
                         )
+                        marker = _auth_failure_marker(stderr_tail, stdout_tail)
+                        error: WorkerStartError
+                        if marker is not None:
+                            error = WorkerAuthError(
+                                "warm worker authentication failed",
+                                marker=marker,
+                                stderr_tail=stderr_tail,
+                                stdout_tail=stdout_tail,
+                            )
+                        else:
+                            error = WorkerStartError(
+                                "warm worker exited during startup",
+                                stderr_tail=stderr_tail,
+                            )
                         logger.warning("%s", error)
                         self._spawn_cooldown_until = time.monotonic() + 30.0
                         await worker.kill()

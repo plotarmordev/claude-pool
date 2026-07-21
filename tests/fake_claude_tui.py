@@ -205,6 +205,12 @@ def main() -> int:
     if startup == "autherr":
         write_screen("Invalid API key . Please run /login")
         return 1
+    if startup == "authstall":
+        write_screen("Failed to authenticate: OAuth session expired")
+        while True:
+            time.sleep(60.0)
+    if startup == "ratelimit":
+        write_screen("Rate limit reached; service overloaded")
 
     if os.environ.get("FAKE_TUI_TRUST") == "1":
         write_screen("Do you trust the files in this folder?")

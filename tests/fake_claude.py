@@ -134,6 +134,14 @@ def _handle_startup() -> None:
         sys.stderr.write("Invalid API key · Please run /login\n")
         sys.stderr.flush()
         raise SystemExit(1)
+    if startup == "authstall":
+        sys.stderr.write("Failed to authenticate: OAuth session expired\n")
+        sys.stderr.flush()
+        time.sleep(30)
+    if startup == "ratelimitstall":
+        sys.stderr.write("Rate limit reached; service overloaded\n")
+        sys.stderr.flush()
+        time.sleep(30)
 
 
 def _handle_prompt(prompt: str, session_id: str, num_turns: int) -> None:

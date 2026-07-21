@@ -94,8 +94,9 @@ A workspace trust dialog can appear before the prompt. The observed dialog is
 answerable by sending a single carriage return to accept the default.
 
 Authentication failures can surface as TUI startup text followed by process
-exit. The worker maps that to `WorkerStartError` with the drained pty tail so
-callers can match text such as `Invalid API key` or `/login`.
+exit. The worker maps known authentication-failure markers to `WorkerAuthError`
+with the matched marker and drained pty tail, without waiting for the full
+readiness timeout.
 
 Mid-session usage-limit or policy text is ordinary assistant output from the
 TUI. It is returned as normal `Result.text`; callers classify that text the same
