@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from claude_pool import AskTimeout, Result, WorkerCrashError, _TailBuffer, _Worker
+from claude_pool import AskTimeout, Result, WorkerAuthError, WorkerCrashError, _TailBuffer, _Worker
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -218,10 +218,41 @@ def test_worker_startup_auth_error_carries_login_stderr() -> None:
         try:
             try:
                 await worker.ask("hello", timeout=5.0)
-            except WorkerCrashError as exc:
+            except WorkerAuthError as exc:
                 assert "Please run /login" in exc.stderr_tail
+                assert exc.marker == "invalid api key"
+                assert exc.stdout_tail == ""
             else:
-                raise AssertionError("expected WorkerCrashError")
+                raise AssertionError("expected WorkerAuthError")
+        finally:
+            await worker.kill()
+
+    run(scenario())
+
+
+def test_worker_auth_stderr_interrupts_blocked_spawn_prompt() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake(env={"FAKE_CLAUDE_STARTUP": "authstall"})
+        started = time.monotonic()
+        try:
+            with pytest.raises(WorkerAuthError) as raised:
+                await worker.ask("hello", timeout=10.0)
+
+            assert raised.value.marker == "failed to authenticate"
+            assert "OAuth session expired" in raised.value.stderr_tail
+            assert time.monotonic() - started < 2.0
+        finally:
+            await worker.kill()
+
+    run(scenario())
+
+
+def test_worker_rate_limit_stderr_does_not_trigger_auth_error() -> None:
+    async def scenario() -> None:
+        worker = await spawn_fake(env={"FAKE_CLAUDE_STARTUP": "ratelimitstall"})
+        try:
+            with pytest.raises(AskTimeout):
+                await worker.ask("hello", timeout=0.3)
         finally:
             await worker.kill()
 

@@ -145,6 +145,11 @@ The daemon accepts the same knobs:
 claude-pool serve --backend tui --warm 2 --tui-ready-timeout 75 --spawn-concurrency 2
 ```
 
+## Authentication Failures
+
+Authentication failures fail fast with `WorkerAuthError`. Headless deployments should prefer
+`CLAUDE_CODE_OAUTH_TOKEN` via the `env=` parameter.
+
 ## How It Works
 
 ```text
@@ -212,11 +217,13 @@ output. Claude Code can put error text in the same field as successful output.
 | `ClaudePoolError` | Base class for pool errors and closed sessions. |
 | `PoolClosed` | Work is requested after a pool has closed. |
 | `WorkerStartError` | A worker process cannot be started. |
+| `WorkerAuthError` | Worker startup output matches a known authentication-failure marker. |
 | `WorkerCrashError` | A worker exits before producing a result. |
 | `AskTimeout` | A prompt exceeds its timeout and the worker is killed. |
 
 `WorkerStartError` and `WorkerCrashError` expose `stderr_tail`, a bounded tail
-of worker stderr.
+of worker stderr. `WorkerAuthError` also exposes the matched `marker` and a bounded
+`stdout_tail`.
 
 ## Supported Platforms
 

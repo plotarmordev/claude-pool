@@ -10,7 +10,14 @@ from typing import Any
 
 import pytest
 
-from claude_pool import ClaudePool, ClaudePoolError, PoolClosed, WorkerCrashError, WorkerStartError
+from claude_pool import (
+    ClaudePool,
+    ClaudePoolError,
+    PoolClosed,
+    WorkerAuthError,
+    WorkerCrashError,
+    WorkerStartError,
+)
 from claude_pool import _LIVE_PGIDS
 
 
@@ -242,6 +249,25 @@ def test_cold_worker_crash_propagates() -> None:
         try:
             with pytest.raises(WorkerCrashError):
                 await pool.ask("crash")
+        finally:
+            await pool.aclose()
+
+    run(scenario())
+
+
+def test_cold_worker_auth_failure_propagates_promptly() -> None:
+    async def scenario() -> None:
+        pool = ClaudePool(
+            **pool_kwargs(env={"FAKE_CLAUDE_STARTUP": "authstall"}, default_timeout=10.0)
+        )
+        started = time.monotonic()
+        try:
+            with pytest.raises(WorkerAuthError) as raised:
+                await pool.ask("auth-failure")
+
+            assert raised.value.marker == "failed to authenticate"
+            assert "OAuth session expired" in raised.value.stderr_tail
+            assert time.monotonic() - started < 2.0
         finally:
             await pool.aclose()
 
